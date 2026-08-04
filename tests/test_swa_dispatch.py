@@ -152,7 +152,7 @@ def main() -> int:
         tokens_per_block=TOKENS_PER_BLOCK,
         enable_cpu=True,
         enable_ssd=False,
-        enable_remote=False,
+        enable_lake=False,
         num_cpu_blocks=NUM_BLOCKS_CPU,
         swa=SWAPoolConfig(
             enabled=True,

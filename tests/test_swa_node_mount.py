@@ -8,8 +8,8 @@ coverage, in three sections:
 
   1. PURE-PYTHON SPEC  (flexkv/cache/radixtree.py RadixTreeIndex) — the
      executable spec; numpy-only, runs anywhere.
-  2. C++ PRODUCTION    (flexkv.c_ext CRadixTreeIndex, the DSv4 path with
-     FLEXKV_INDEX_ACCEL=1) — the same invariants on the shipped implementation.
+  2. C++ PRODUCTION    (flexkv.c_ext CRadixTreeIndex, the DSv4 path always
+     used in production) — the same invariants on the shipped implementation.
      (test_swa_cnode_cascade.py targets the P2P-only LocalRadixTree and skips in
      the default build; this section is the production coverage.)
   3. WORKLOAD STRESS   — a stochastic multi-turn dialogue through the production

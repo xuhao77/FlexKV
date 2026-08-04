@@ -34,7 +34,7 @@ from flexkv.transfer import trace
 from flexkv.transfer.worker import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
-    CPURemoteTransferWorker,
+    CPULakeTransferWorker,
     GPUCPUTransferWorker,
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
@@ -73,8 +73,8 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.DISK2H: (3, 2),   # SSD -> CPU
         TransferType.DISK2D: (3, 1),   # SSD -> GPU
         TransferType.D2DISK: (1, 3),   # GPU -> SSD
-        TransferType.H2REMOTE: (2, 4), # CPU -> REMOTE
-        TransferType.REMOTE2H: (4, 2), # REMOTE -> CPU
+        TransferType.H2LAKE: (2, 4),   # CPU -> LAKE
+        TransferType.LAKE2H: (4, 2),   # LAKE -> CPU
         TransferType.PEERH2H: (5, 2),  # PEER_CPU -> CPU
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
@@ -135,13 +135,13 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None,
+        lake_handle: Optional[StorageHandle] = None,
         gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None,
         gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = None,
         swa_gpu_handles: Optional[Dict[WorkerKey, List[StorageHandle]]] = None,
         swa_cpu_handle: Optional[StorageHandle] = None,
         swa_ssd_handle: Optional[StorageHandle] = None,
-        swa_remote_handle: Optional[StorageHandle] = None,
+        swa_lake_handle: Optional[StorageHandle] = None,
         swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
         swa_gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None,
         swa_gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = None,
@@ -155,7 +155,7 @@ class TransferEngine:
             cache_config: global CacheConfig
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
-            remote_handle: Optional remote handle
+            lake_handle: Optional lake handle
             gpu_blocks_per_group: Per-group GPU handles, keyed by WorkerKey
             gpu_layouts_per_group: Per-group GPU layouts, keyed by WorkerKey
         """
@@ -182,7 +182,7 @@ class TransferEngine:
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
-        self._remote_handle = remote_handle
+        self._lake_handle = lake_handle
         self._gpu_blocks_per_group = gpu_blocks_per_group
         self._gpu_layouts_per_group = gpu_layouts_per_group
 
@@ -190,7 +190,7 @@ class TransferEngine:
         self._swa_gpu_handles = swa_gpu_handles
         self._swa_cpu_handle = swa_cpu_handle
         self._swa_ssd_handle = swa_ssd_handle
-        self._swa_remote_handle = swa_remote_handle
+        self._swa_lake_handle = swa_lake_handle
         self._swa_layer_groups = (
             swa_cpu_handle.kv_layout.layer_groups
             if swa_cpu_handle is not None
@@ -209,10 +209,7 @@ class TransferEngine:
         self._has_swa = (swa_gpu_handles is not None and len(swa_gpu_handles) > 0
                          and swa_cpu_handle is not None)
         self._cache_config = cache_config
-        # TODO: is this correct?
-        self._enable_pcfs_sharing = (
-            GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing
-        )
+        self._enable_pcfs_sharing = cache_config.enable_kv_sharing
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -577,32 +574,32 @@ class TransferEngine:
                 layer_groups=ssd_layer_groups,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
-        if self._remote_handle is not None and self._cpu_handle is not None:
-            self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+        if self._lake_handle is not None and self._cpu_handle is not None:
+            self.lakecpu_read_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
+                lake_file=self._lake_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
+                lake_kv_layout=self._lake_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
+                lake_config_custom=self._lake_handle.lake_config_custom,
                 enable_pcfs_sharing=self._enable_pcfs_sharing,
             )
-            self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+            self.lakecpu_write_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
+                lake_file=self._lake_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
+                lake_kv_layout=self._lake_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
+                lake_config_custom=self._lake_handle.lake_config_custom,
             )
-            self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
-            self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+            self._worker_map[TransferType.H2LAKE] = self.lakecpu_write_worker
+            self._worker_map[TransferType.LAKE2H] = self.lakecpu_read_worker
         elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
               and self._cpu_handle is not None):
             self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
@@ -615,10 +612,10 @@ class TransferEngine:
                 cache_config=self.cache_config,
                 pool_kind=PoolKind.KV,
             )
-            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
-            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            self._worker_map[TransferType.H2LAKE] = self.mooncake_store_worker
+            self._worker_map[TransferType.LAKE2H] = self.mooncake_store_worker
             flexkv_logger.info(
-                "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
+                "[TransferEngine] mooncake-store workers created for H2LAKE/LAKE2H")
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:
@@ -741,8 +738,8 @@ class TransferEngine:
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                # TODO: get remote kv_layout, now we can assume that remote kv layout is same as current node
-                remote_kv_layout=self._cpu_handle.kv_layout,
+                # TODO: get peer kv_layout; for now assume it matches the local node
+                peer_kv_layout=self._cpu_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 cache_config = self.cache_config,
                 ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
@@ -890,7 +887,7 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
-            # ---- SWA CPU<->Remote workers -----------------------------------
+            # ---- SWA CPU<->Lake workers -------------------------------------
             if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
                     and self._swa_cpu_handle is not None):
                 self.swa_mooncake_store_worker: WorkerHandle = (
@@ -905,37 +902,37 @@ class TransferEngine:
                         pool_kind=PoolKind.SWA,
                         override_global_segment_size=0,
                     ))
-                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_mooncake_store_worker
-                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_mooncake_store_worker
+                self._swa_worker_map[TransferType.LAKE2H] = self.swa_mooncake_store_worker
+                self._swa_worker_map[TransferType.H2LAKE] = self.swa_mooncake_store_worker
                 flexkv_logger.info(
                     "TransferEngine: swa mooncake-store workers initialized")
-            elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
-                self.swa_remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+            elif self._swa_lake_handle is not None and self._swa_cpu_handle is not None:
+                self.swa_lakecpu_read_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
                     cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                    remote_file=self._swa_remote_handle.get_file_list(),
+                    lake_file=self._swa_lake_handle.get_file_list(),
                     cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                    remote_kv_layout=self._swa_remote_handle.kv_layout,
+                    lake_kv_layout=self._swa_lake_handle.kv_layout,
                     dtype=self._swa_cpu_handle.dtype,
-                    remote_config_custom=self._swa_remote_handle.remote_config_custom,
+                    lake_config_custom=self._swa_lake_handle.lake_config_custom,
                     enable_pcfs_sharing=self._enable_pcfs_sharing,
                 )
-                self.swa_remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+                self.swa_lakecpu_write_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
                     cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                    remote_file=self._swa_remote_handle.get_file_list(),
+                    lake_file=self._swa_lake_handle.get_file_list(),
                     cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                    remote_kv_layout=self._swa_remote_handle.kv_layout,
+                    lake_kv_layout=self._swa_lake_handle.kv_layout,
                     dtype=self._swa_cpu_handle.dtype,
-                    remote_config_custom=self._swa_remote_handle.remote_config_custom,
+                    lake_config_custom=self._swa_lake_handle.lake_config_custom,
                 )
-                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_remotecpu_read_worker
-                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_remotecpu_write_worker
-                flexkv_logger.info("TransferEngine: swa CPU<->Remote workers initialized")
+                self._swa_worker_map[TransferType.LAKE2H] = self.swa_lakecpu_read_worker
+                self._swa_worker_map[TransferType.H2LAKE] = self.swa_lakecpu_write_worker
+                flexkv_logger.info("TransferEngine: swa CPU<->Lake workers initialized")
 
 
             if self.cache_config.enable_gds and self._swa_ssd_handle is not None:
@@ -1461,7 +1458,7 @@ class TransferEngine:
             This is needed because each PP stage holds its own slice of SWA
             layers, exactly like the main-KV path: a single submit to one
             sibling would silently drop the other stages\' SWA data.
-          * single-instance worker_entry (CPU<->SSD / CPU<->Remote)
+          * single-instance worker_entry (CPU<->SSD / CPU<->Lake)
             -> no fan-out; pending_count++ and submit op directly.
             register_op_to_buffer + op_id_to_op are done by the scheduler
             upstream for this branch, exactly like main-KV single-worker.

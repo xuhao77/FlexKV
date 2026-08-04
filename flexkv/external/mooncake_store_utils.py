@@ -12,7 +12,7 @@ Three public objects are exposed:
   ``MooncakeDistributedStore`` with FlexKV-friendly helpers.
 * ``MooncakeStoreCacheEngine`` – presents a ``match()`` / ``insert()``
   interface compatible with ``CacheEngineAccel`` so it can be used as
-  ``remote_cache_engine`` inside the ``KVCacheManager`` factory.
+  ``lake_cache_engine`` inside the ``KVCacheManager`` factory.
 """
 
 from __future__ import annotations
@@ -479,7 +479,7 @@ class MooncakeStoreCacheEngine:
     """
     Presents the same ``match()`` / ``insert()`` interface as
     ``CacheEngineAccel`` so that it can be dropped in as
-    ``KVCacheManager.remote_cache_engine``.
+    ``KVCacheManager.lake_cache_engine``.
 
     """
 
@@ -603,7 +603,7 @@ class MooncakeStoreCacheEngine:
 
     def match_swa_from_result(self, match_result, sequence_meta, upper_bound_blocks: int,
                               lock_for_load: bool = False):
-        """Mooncake REMOTE tier: SWA is keyed by tail hash, not a mounted slot."""
+        """Mooncake LAKE tier: SWA is keyed by tail hash, not a mounted slot."""
         del lock_for_load
         swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result else 0
         if swa_hit <= 0 or upper_bound_blocks <= 0:

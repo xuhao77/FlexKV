@@ -121,7 +121,7 @@ def _run(transfer_engines) -> int:
                                cp_size=1)
     cache_config = CacheConfig(
         tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
-        enable_remote=False, num_cpu_blocks=NUM_BLOCKS_CPU,
+        enable_lake=False, num_cpu_blocks=NUM_BLOCKS_CPU,
         swa=SWAPoolConfig(enabled=True, num_slots=NUM_SWA_SLOTS,
                           num_swa_layers=NUM_LAYERS,
                           bytes_per_token_per_layer=BYTES_PER_TOKEN_PER_LAYER,

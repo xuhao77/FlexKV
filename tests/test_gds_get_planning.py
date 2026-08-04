@@ -75,14 +75,13 @@ def _build_local_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
         enable_p2p_cpu=False,
     )
     engine.cpu_cache_engine = cpu_cache
-    engine.index_accel = False
     engine._metrics_collector = None
-    engine.match_local = lambda sequence_meta, strategy: (
+    engine.match_without_lake = lambda sequence_meta, strategy, **kwargs: (
         _match(cpu_blocks),
         _match(ssd_blocks),
     )
 
-    plan = engine._get_impl_local(
+    plan = engine._get_impl_without_lake(
         request_id=1,
         sequence_meta=object(),
         block_mask_start=0,

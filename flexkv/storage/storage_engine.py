@@ -14,7 +14,7 @@ from flexkv.storage.allocator import (
     CPUAllocator,
     GPUAllocator,
     HugePageAllocator,
-    RemoteAllocator,
+    LakeAllocator,
     SSDAllocator,
 )
 
@@ -76,7 +76,7 @@ class StorageEngine:
                 "SWA multi-group sidecars require FLEXKV_CPU_LAYOUT=BLOCKFIRST"
             )
 
-        # For multi-group, the CPU/SSD/Remote buffer is sized in BYTES
+        # For multi-group, the CPU/SSD/Lake buffer is sized in BYTES
         # (kv_shape[1] = bytes_per_block, summed with per-group dtype.itemsize),
         # so the underlying allocator must use uint8.  Single-group keeps its
         # native dtype.
@@ -125,19 +125,19 @@ class StorageEngine:
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
 
-        if self._cache_config.enable_remote:
+        if self._cache_config.enable_lake:
             if self._cache_config.use_mooncake_store_backend:
                 flexkv_logger.info(
                     "[StorageEngine] mooncake-store backend: hot CPU buffer will be "
                     "registered directly (no separate contributed region)."
                 )
             else:
-                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
-                    raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-                self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                if not GLOBAL_CONFIG_FROM_ENV.lake_layout_type == self._cpu_layout.type:
+                    raise ValueError(f"Lake layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+                self._lake_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.lake_layout_type,
                     num_layer=num_layers_per_pp_stage,
-                    num_block=self._cache_config.num_remote_blocks,
+                    num_block=self._cache_config.num_lake_blocks,
                     tokens_per_block=self._cache_config.tokens_per_block,
                     num_head=self._model_config.num_kv_heads_per_node,
                     head_size=self._model_config.head_size,
@@ -147,17 +147,17 @@ class StorageEngine:
                     tp_size=self._model_config.tp_size,
                 )
                 self.allocate(
-                    device_type=DeviceType.REMOTE,
-                    layout=self._remote_layout,
+                    device_type=DeviceType.LAKE,
+                    layout=self._lake_layout,
                     dtype=buffer_dtype,
-                    file_path=self._cache_config.remote_cache_path,
-                    remote_config_custom = self._cache_config.remote_config_custom
+                    file_path=self._cache_config.lake_cache_path,
+                    lake_config_custom = self._cache_config.lake_config_custom
                 )
 
         # SWA pool allocate
         self._swa_cpu_layout: Optional[KVCacheLayout] = None
         self._swa_ssd_layout: Optional[KVCacheLayout] = None
-        self._swa_remote_layout: Optional[KVCacheLayout] = None
+        self._swa_lake_layout: Optional[KVCacheLayout] = None
         swa_cfg = getattr(self._cache_config, "swa", None)
         if swa_cfg is not None and swa_cfg.enabled:
             swa_tokens_per_block = self._cache_config.tokens_per_block
@@ -215,7 +215,7 @@ class StorageEngine:
                     max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
                 )
 
-            if self._cache_config.enable_remote and swa_cfg.num_remote_slots > 0:
+            if self._cache_config.enable_lake and swa_cfg.num_lake_slots > 0:
                 if self._cache_config.use_mooncake_store_backend:
                     flexkv_logger.info(
                         "[StorageEngine] mooncake-store backend: hot SWA CPU buffer will be "
@@ -223,16 +223,16 @@ class StorageEngine:
                     )
                 else:
                     if self._swa_cpu_layout is None:
-                        raise ValueError("SWA REMOTE tier requires the SWA CPU tier")
-                    if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._swa_cpu_layout.type:
+                        raise ValueError("SWA LAKE tier requires the SWA CPU tier")
+                    if not GLOBAL_CONFIG_FROM_ENV.lake_layout_type == self._swa_cpu_layout.type:
                         raise ValueError(
-                            f"SWA Remote layout type must match SWA CPU layout type: "
+                            f"SWA Lake layout type must match SWA CPU layout type: "
                             f"{self._swa_cpu_layout.type}"
                         )
-                    self._swa_remote_layout = KVCacheLayout(
-                        type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    self._swa_lake_layout = KVCacheLayout(
+                        type=GLOBAL_CONFIG_FROM_ENV.lake_layout_type,
                         num_layer=swa_cfg.num_swa_layers,
-                        num_block=swa_cfg.num_remote_slots,
+                        num_block=swa_cfg.num_lake_slots,
                         tokens_per_block=swa_tokens_per_block,
                         num_head=1,
                         head_size=swa_cfg.bytes_per_token_per_layer,
@@ -240,21 +240,21 @@ class StorageEngine:
                         layer_groups=self._swa_layer_groups,
                         tp_size=self._model_config.tp_size,
                     )
-                    swa_remote_path = self._cache_config.remote_cache_path
-                    if isinstance(swa_remote_path, str):
-                        swa_remote_path = swa_remote_path + "_swa"
-                    elif isinstance(swa_remote_path, list):
-                        swa_remote_path = [path + "_swa" for path in swa_remote_path]
+                    swa_lake_path = self._cache_config.lake_cache_path
+                    if isinstance(swa_lake_path, str):
+                        swa_lake_path = swa_lake_path + "_swa"
+                    elif isinstance(swa_lake_path, list):
+                        swa_lake_path = [path + "_swa" for path in swa_lake_path]
 
                     self.allocate(
-                        device_type=DeviceType.REMOTE,
-                        layout=self._swa_remote_layout,
+                        device_type=DeviceType.LAKE,
+                        layout=self._swa_lake_layout,
                         dtype=torch.uint8,
                         device_id=0,
                         raw_data=None,
                         is_swa=True,
-                        file_path=swa_remote_path,
-                        remote_config_custom=self._cache_config.remote_config_custom,
+                        file_path=swa_lake_path,
+                        lake_config_custom=self._cache_config.lake_config_custom,
                     )
 
 
@@ -316,7 +316,7 @@ class StorageEngine:
         Create and add an allocator for specified device.
 
         Args:
-            device_type: Type of the device (CPU, GPU, SSD, REMOTE).
+            device_type: Type of the device (CPU, GPU, SSD, LAKE).
             layout: Layout of kv cache.
             dtype: Data type of tensors.
             device_id: Device ID (default 0).
@@ -328,8 +328,8 @@ class StorageEngine:
                                                ``List[torch.Tensor]``
                       * ``DeviceType.SSD``    – ``str`` or ``List[str]``
                         (file path(s) to existing SSD cache files)
-                      * ``DeviceType.REMOTE`` – ``str`` or ``List[str]``
-                        (remote file path(s))
+                      * ``DeviceType.LAKE`` – ``str`` or ``List[str]``
+                        (lake file path(s))
             **kwargs: Additional arguments for specific allocator types
                      (e.g., pin_memory for CPU, file_path for Disk).
 
@@ -420,32 +420,32 @@ class StorageEngine:
                     file_prefix=file_prefix,
                     max_file_size_gb=max_file_size_gb
                 )
-        elif device_type == DeviceType.REMOTE:
+        elif device_type == DeviceType.LAKE:
             file_path = kwargs.get('file_path')
-            remote_config_custom = kwargs.get('remote_config_custom')
+            lake_config_custom = kwargs.get('lake_config_custom')
             if raw_data is not None:
                 if (isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data))):
-                    if not isinstance(remote_config_custom, dict):
-                        raise TypeError("remote_config_custom for RemoteAllocator.from_raw_data must be dict[str, Any]")
-                    storage_handle = RemoteAllocator.from_raw_data(
+                    if not isinstance(lake_config_custom, dict):
+                        raise TypeError("lake_config_custom for LakeAllocator.from_raw_data must be dict[str, Any]")
+                    storage_handle = LakeAllocator.from_raw_data(
                         data=raw_data,  # type: ignore
                         layout=layout,
                         dtype=dtype,
-                        remote_config_custom=remote_config_custom
+                        lake_config_custom=lake_config_custom
                     )
                 else:
-                    raise TypeError("raw_data for RemoteAllocator must be str or List[str]")
+                    raise TypeError("raw_data for LakeAllocator must be str or List[str]")
             else:
                 if not file_path:
-                    raise ValueError("file_path is required for remote allocator")
-                if not isinstance(remote_config_custom, dict):
-                    raise TypeError("remote_config_custom for RemoteAllocator must be dict[str, Any]")
-                storage_handle = RemoteAllocator.allocate(
+                    raise ValueError("file_path is required for lake allocator")
+                if not isinstance(lake_config_custom, dict):
+                    raise TypeError("lake_config_custom for LakeAllocator must be dict[str, Any]")
+                storage_handle = LakeAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
                     file_path=file_path,
-                    remote_config_custom=remote_config_custom
+                    lake_config_custom=lake_config_custom
                 )
         else:
             raise ValueError(f"Unsupported device type: {device_type}")

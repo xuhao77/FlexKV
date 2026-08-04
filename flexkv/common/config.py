@@ -576,7 +576,7 @@ class SWAPoolConfig:
     enabled: bool = False
     num_slots: int = 1024              # Number of CPU SWA pool slots
     num_ssd_slots: int = 0             # Number of SSD SWA pool slots (0 = no SSD SWA tier)
-    num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
+    num_lake_slots: int = 0            # Number of LAKE SWA pool slots (0 = no LAKE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
     # True when the SWA page also carries heterogeneous sidecar groups (for
@@ -591,16 +591,16 @@ class SWAPoolConfig:
         SSD SWA slots are not pinned host memory; pin_memory is forced off."""
         return replace(self, num_slots=self.num_ssd_slots, pin_memory=False)
 
-    def for_remote_tier(self) -> "SWAPoolConfig":
-        """Derive the REMOTE-tier SWA config (same slot geometry, num_remote_slots).
+    def for_lake_tier(self) -> "SWAPoolConfig":
+        """Derive the LAKE-tier SWA config (same slot geometry, num_lake_slots).
 
-        REMOTE SWA slots are not pinned host memory; pin_memory is forced off."""
-        return replace(self, num_slots=self.num_remote_slots, pin_memory=False)
+        LAKE SWA slots are not pinned host memory; pin_memory is forced off."""
+        return replace(self, num_slots=self.num_lake_slots, pin_memory=False)
 
     def for_cache_tier(self, device_type) -> Optional["SWAPoolConfig"]:
         """Return the SWA config this cache tier should own, or None.
 
-        CPU uses the primary pool config. SSD and REMOTE use their tier-specific
+        CPU uses the primary pool config. SSD and LAKE use their tier-specific
         slot counts and are disabled when that tier's slot count is zero.
         """
         if not self.enabled:
@@ -610,8 +610,8 @@ class SWAPoolConfig:
             return self
         if device_name == "SSD" and self.num_ssd_slots > 0:
             return self.for_ssd_tier()
-        if device_name == "REMOTE" and self.num_remote_slots > 0:
-            return self.for_remote_tier()
+        if device_name == "LAKE" and self.num_lake_slots > 0:
+            return self.for_lake_tier()
         return None
 
 
@@ -626,12 +626,12 @@ class CacheConfig:
     enable_nixl: bool = False
     # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
     nixl_extra_config: Optional[Dict[str, Any]] = None
-    enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
-                                # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
-    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
+    enable_lake: bool = False # derived from enable_3rd_lake / use_mooncake_store_backend;
+                              # mutually exclusive with CPU/SSD P2P
+    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_lake
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
-    enable_3rd_remote: bool = False
+    enable_3rd_lake: bool = False
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
     num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
@@ -650,20 +650,20 @@ class CacheConfig:
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
-    num_remote_blocks: Optional[int] = None
+    num_lake_blocks: Optional[int] = None
     num_local_blocks: int = 1000000
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
 
-    # remote cache configs for cfs
+    # lake cache configs for cfs
     # todo: remove this in the future
-    remote_cache_size_mode: str = "file_size"  # file_size or block_num
-    remote_file_size: Optional[int] = None
-    remote_file_num: Optional[int] = None
-    remote_file_prefix: Optional[str] = None
-    remote_cache_path: Optional[Union[str, List[str]]] = None
-    remote_config_custom: Optional[Dict[str, Any]] = None
+    lake_cache_size_mode: str = "file_size"  # file_size or block_num
+    lake_file_size: Optional[int] = None
+    lake_file_num: Optional[int] = None
+    lake_file_prefix: Optional[str] = None
+    lake_cache_path: Optional[Union[str, List[str]]] = None
+    lake_config_custom: Optional[Dict[str, Any]] = None
 
     # distributed zmq configs
     local_zmq_ip: str = "127.0.0.1"
@@ -706,8 +706,8 @@ class CacheConfig:
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
-            self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
+            self.enable_p2p_ssd or self.enable_3rd_lake
+        self.enable_lake = self.enable_3rd_lake or self.use_mooncake_store_backend
         self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(
             int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', '0')))
         if self.use_mooncake_store_backend and self.mooncake_store_config_path is None:
@@ -717,16 +717,29 @@ class CacheConfig:
                 raise ValueError(
                     "Mooncake store config path not found; set "
                     "mooncake_store_config_path or FLEXKV_MOONCAKE_STORE_CONFIG_PATH")
+        self.validate_lake_p2p_exclusive()
+
+    def validate_lake_p2p_exclusive(self) -> None:
+        """A lake tier and CPU/SSD P2P cannot be combined.
+
+        Enabling lake routes get/put through ``_get/_put_impl_with_lake``, whose
+        per-tier match cannot reach peer CPU/SSD data at all — a P2P config would
+        silently degrade to local-only instead of failing. Reject it up front.
+        """
+        if self.enable_lake and (self.enable_p2p_cpu or self.enable_p2p_ssd):
+            raise ValueError(
+                "Lake cannot be enabled together with P2P CPU or P2P SSD"
+            )
 
     def __str__(self) -> str:
         return (
             f"CacheConfig(tokens_per_block={self.tokens_per_block}"
             f", enable_cpu={self.enable_cpu}, enable_ssd={self.enable_ssd}"
-            f", enable_gds={self.enable_gds}, enable_remote={self.enable_remote}"
+            f", enable_gds={self.enable_gds}, enable_lake={self.enable_lake}"
             f", enable_kv_sharing={self.enable_kv_sharing}"
             f", enable_p2p_cpu={self.enable_p2p_cpu}"
             f", enable_p2p_ssd={self.enable_p2p_ssd}"
-            f", enable_3rd_remote={self.enable_3rd_remote}"
+            f", enable_3rd_lake={self.enable_3rd_lake}"
             f", num_cpu_blocks={self.num_cpu_blocks}"
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
@@ -751,10 +764,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
-    index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKFIRST').upper()),
-    remote_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_REMOTE_LAYOUT', 'BLOCKFIRST').upper()),
+    lake_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_LAKE_LAYOUT', 'BLOCKFIRST').upper()),
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKFIRST').upper()),
 
     enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
@@ -831,7 +843,7 @@ class UserConfig:
     hugepage_size_bytes: int = 2 * 1024 * 1024
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
-    enable_3rd_remote: bool = False
+    enable_3rd_lake: bool = False
     use_mooncake_store_backend: bool = False
     mooncake_store_config_path: Optional[str] = None
     mooncake_store_pp_rank: int = 0
@@ -870,6 +882,14 @@ class UserConfig:
             raise ValueError(
                 "swa_multi_group must be a boolean when configured, "
                 f"got {self.swa_multi_group!r}"
+            )
+        # Mirrors CacheConfig.validate_lake_p2p_exclusive; checked here on the
+        # user-facing flags so a bad config fails at UserConfig construction
+        # instead of only once it has been folded into a CacheConfig.
+        if ((self.enable_3rd_lake or self.use_mooncake_store_backend)
+                and (self.enable_p2p_cpu or self.enable_p2p_ssd)):
+            raise ValueError(
+                "Lake cannot be enabled together with P2P CPU or P2P SSD"
             )
 
 def parse_path_list(path_str: str) -> List[str]:
@@ -1083,7 +1103,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.hugepage_size_bytes = user_config.hugepage_size_bytes
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
-    cache_config.enable_3rd_remote = user_config.enable_3rd_remote
+    cache_config.enable_3rd_lake = user_config.enable_3rd_lake
     cache_config.use_mooncake_store_backend = user_config.use_mooncake_store_backend
     cache_config.mooncake_store_config_path = user_config.mooncake_store_config_path
     cache_config.mooncake_store_pp_rank = int(rank_info.pp_rank)
@@ -1092,12 +1112,13 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if int(rank_info.model_config.nnodes) == 1:
         cache_config.mooncake_store_node_layer_start = 0
         cache_config.mooncake_store_node_layer_end = int(rank_info.model_config.num_layers)
-    # Update derived flags after setting p2p and remote configs
+    # Update derived flags after setting p2p and lake configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
                                       cache_config.enable_p2p_ssd or
-                                      cache_config.enable_3rd_remote)
-    cache_config.enable_remote = (cache_config.enable_3rd_remote or
-                                  cache_config.use_mooncake_store_backend)
+                                      cache_config.enable_3rd_lake)
+    cache_config.enable_lake = (cache_config.enable_3rd_lake or
+                                cache_config.use_mooncake_store_backend)
+    cache_config.validate_lake_p2p_exclusive()
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
@@ -1107,8 +1128,8 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     if not cache_config.enable_cpu:
         raise ValueError("enable_cpu must be True")
-    # SSD and REMOTE are peer cold tiers under CPU (H2DISK vs H2REMOTE);
-    # enabling remote does not require a local SSD mid-tier.
+    # SSD and LAKE are peer cold tiers under CPU (H2DISK vs H2LAKE);
+    # enabling lake does not require a local SSD mid-tier.
     if not cache_config.enable_cpu and not cache_config.enable_gds:
         raise ValueError("enable_gds must be True if enable_cpu is False")
     if cache_config.enable_gds and not cache_config.enable_ssd:
@@ -1118,53 +1139,53 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             "enable_kv_sharing and enable_gds cannot be used at the same time"
         )
 
-    if cache_config.enable_remote and not cache_config.use_mooncake_store_backend:
-        if cache_config.remote_cache_path is None:
-            if cache_config.remote_file_prefix is None:
+    if cache_config.enable_lake and not cache_config.use_mooncake_store_backend:
+        if cache_config.lake_cache_path is None:
+            if cache_config.lake_file_prefix is None:
                 raise ValueError(
-                    "remote_file_prefix must be provided when remote_cache_path is None"
+                    "lake_file_prefix must be provided when lake_cache_path is None"
                 )
-            if (cache_config.remote_file_num is None
-                    or cache_config.remote_file_num <= 0):
-                raise ValueError("remote_file_num must be a positive integer")
-            cache_config.remote_cache_path = [
-                f"{cache_config.remote_file_prefix}_{i}"
-                for i in range(cache_config.remote_file_num)
+            if (cache_config.lake_file_num is None
+                    or cache_config.lake_file_num <= 0):
+                raise ValueError("lake_file_num must be a positive integer")
+            cache_config.lake_cache_path = [
+                f"{cache_config.lake_file_prefix}_{i}"
+                for i in range(cache_config.lake_file_num)
             ]
 
-        if cache_config.remote_cache_size_mode not in ("block_num", "file_size"):
+        if cache_config.lake_cache_size_mode not in ("block_num", "file_size"):
             raise ValueError(
-                f"remote_cache_size_mode must be 'block_num' or 'file_size', "
-                f"got {cache_config.remote_cache_size_mode!r}"
+                f"lake_cache_size_mode must be 'block_num' or 'file_size', "
+                f"got {cache_config.lake_cache_size_mode!r}"
             )
 
-        if cache_config.remote_cache_size_mode == "file_size":
-            if cache_config.remote_file_size is None:
+        if cache_config.lake_cache_size_mode == "file_size":
+            if cache_config.lake_file_size is None:
                 raise ValueError(
-                    "remote_file_size must be set when remote_cache_size_mode == 'file_size'"
+                    "lake_file_size must be set when lake_cache_size_mode == 'file_size'"
                 )
-            if (cache_config.remote_file_num is None
-                    or cache_config.remote_file_num <= 0):
-                raise ValueError("remote_file_num must be a positive integer")
-            cache_config.num_remote_blocks = (
-                cache_config.remote_file_size // block_size_in_bytes
-                * cache_config.remote_file_num
+            if (cache_config.lake_file_num is None
+                    or cache_config.lake_file_num <= 0):
+                raise ValueError("lake_file_num must be a positive integer")
+            cache_config.num_lake_blocks = (
+                cache_config.lake_file_size // block_size_in_bytes
+                * cache_config.lake_file_num
             )
             flexkv_logger.info(
-                f"num_remote_blocks derived from remote_file_size "
+                f"num_lake_blocks derived from lake_file_size "
                 f"(per-pp-stage, num_layers_per_pp_stage="
                 f"{rank_info.num_layers_per_pp_stage}): "
-                f"remote_file_size={cache_config.remote_file_size}, "
-                f"remote_file_num={cache_config.remote_file_num}, "
+                f"lake_file_size={cache_config.lake_file_size}, "
+                f"lake_file_num={cache_config.lake_file_num}, "
                 f"block_size_in_bytes={block_size_in_bytes} "
-                f"-> num_remote_blocks={cache_config.num_remote_blocks}"
+                f"-> num_lake_blocks={cache_config.num_lake_blocks}"
             )
 
-        if (cache_config.num_remote_blocks is None
-                or cache_config.num_remote_blocks <= 0):
+        if (cache_config.num_lake_blocks is None
+                or cache_config.num_lake_blocks <= 0):
             raise ValueError(
-                "num_remote_blocks must be a positive integer "
-                "(file_size mode: derived above from remote_file_size; "
+                "num_lake_blocks must be a positive integer "
+                "(file_size mode: derived above from lake_file_size; "
                 "block_num mode: set it explicitly)"
             )
 

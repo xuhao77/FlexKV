@@ -20,7 +20,7 @@ GPU
   └─ C4 indexer state     ─┴─ SWA multi-group sidecar
                              │
                              ▼
-                   CPU / SSD / Remote
+                   CPU / SSD / Lake
 ```
 
 需要特别说明：当前实现做的是 state 快照的 offload/restore，不是在 restore 后重算 state。它补齐了之前缺失的 I/O；恢复后的 state 是否满足新一轮 decode 的语义，仍需通过 CP8 精度实验最终确认。
@@ -141,7 +141,7 @@ TransferManager 会：
 
 没有提供这些字段时，FlexKV 继续使用原来的 uniform SWA 路径，其他模型不受影响。
 
-## 5. CPU、SSD 和 Remote 的数据布局
+## 5. CPU、SSD 和 Lake 的数据布局
 
 ### 5.1 BLOCKFIRST byte-flat block
 
@@ -190,12 +190,12 @@ GPU 上每个 group 保留原生 tensor、dtype 和 layout。`GPUCPUTransferWork
 
 D2H 时，各组数据写入同一个 Host block 的不同 byte region；H2D 时执行完全相反的拷贝。
 
-### 5.3 CPU 与 SSD/Remote 之间
+### 5.3 CPU 与 SSD/Lake 之间
 
-CPU、SSD 和 Remote 使用完全相同的 BLOCKFIRST byte-flat layout，因此下层存储不再解析 group：
+CPU、SSD 和 Lake 使用完全相同的 BLOCKFIRST byte-flat layout，因此下层存储不再解析 group：
 
 - CPU ↔ SSD：每个 page 作为一个 opaque byte block 整块读写；
-- CPU ↔ Remote：每个 page 作为一个 MLA byte block 整块读写；
+- CPU ↔ Lake：每个 page 作为一个 MLA byte block 整块读写；
 - GDS GPU ↔ SSD：使用相同的 per-group GPU metadata 和 byte-flat SSD layout。
 
 整块 I/O 还能避免高压缩 state group 的单个 chunk 小于 4 KiB 时产生碎片化读写。
@@ -218,10 +218,10 @@ SGLang start_store_kv
             ├─ attn state    ├─ 写入同一个 Host page block
             └─ index state  ─┘
                          │
-                         └─ 可继续 H2DISK / H2REMOTE
+                         └─ 可继续 H2DISK / H2LAKE
 ```
 
-只对 `put_match` 返回的 unmatched 完整 page 发起搬运。SWA KV 和 state 使用同一个 SWA page id，因此它们在 CPU/SSD/Remote 上也作为同一条 cache entry 的组成部分一起淘汰、命中和迁移。
+只对 `put_match` 返回的 unmatched 完整 page 发起搬运。SWA KV 和 state 使用同一个 SWA page id，因此它们在 CPU/SSD/Lake 上也作为同一条 cache entry 的组成部分一起淘汰、命中和迁移。
 
 ## 7. GET：state 如何 restore
 
@@ -238,7 +238,7 @@ SGLang start_load_kv
   ├─ SWA destination slot_mapping
   └─ launch(...)
        │
-       ├─ DISK/Remote -> Host（如需要）
+       ├─ DISK/Lake -> Host（如需要）
        ├─ SWA/state multi-group H2D
        │    ├─ SWA KV
        │    ├─ attn state
@@ -324,10 +324,10 @@ FlexKV 单测 `tests/test_swa_state_sidecars.py` 覆盖：
 | FlexKV | `flexkv/server/client.py` | 接收并序列化 per-group CUDA handles |
 | FlexKV | `flexkv/server/request.py` | multi-group 注册协议字段 |
 | FlexKV | `flexkv/transfer_manager.py` | 汇总各 device group metadata/handles |
-| FlexKV | `flexkv/storage/storage_engine.py` | 分配 CPU/SSD/Remote byte-flat SWA pool |
+| FlexKV | `flexkv/storage/storage_engine.py` | 分配 CPU/SSD/Lake byte-flat SWA pool |
 | FlexKV | `flexkv/common/storage.py` | 计算 heterogeneous block layout 和 group stride |
 | FlexKV | `flexkv/transfer/transfer_engine.py` | 创建 SWA/state 专用 multi-group worker |
-| FlexKV | `flexkv/transfer/worker.py` | GPU/CPU、SSD、Remote 实际搬运 |
+| FlexKV | `flexkv/transfer/worker.py` | GPU/CPU、SSD、Lake 实际搬运 |
 | FlexKV | `flexkv/common/transfer.py` | layerwise transfer graph 依赖 |
 | FlexKV | `flexkv/kvtask.py` | 根据 `swa.multi_group` 选择 layerwise 路径 |
 | FlexKV | `tests/test_swa_state_sidecars.py` | block layout 和 restore 时序单测 |

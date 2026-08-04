@@ -357,7 +357,7 @@ bash test_dp2_kv_reuse.sh
 | `flexkv/server/request.py` | `RegisterTPClientRequest` 多组字段 |
 | `flexkv/server/client.py` | `register_to_server()` 多组参数 |
 | `flexkv/transfer_manager.py` | 延迟 StorageEngine 创建；layer_groups 传播；block 数重算 |
-| `flexkv/storage/storage_engine.py` | 传递 `layer_groups` 到 CPU/SSD/Remote layout |
+| `flexkv/storage/storage_engine.py` | 传递 `layer_groups` 到 CPU/SSD/Lake layout |
 | `flexkv/transfer/transfer_engine.py` | 存储并分发 per-group GPU 数据到 worker |
 | `flexkv/transfer/worker.py` | GPU stride 自动探测；多组 init/transfer（GPU↔CPU, CPU↔SSD, GDS） |
 | `flexkv/kvtask.py` | `get_match()`/`put_match()` 中 flush D2H 完成事件 |
@@ -369,5 +369,5 @@ bash test_dp2_kv_reuse.sh
 
 - **CPU↔SSD 多组传输**：框架已搭建（`_init_multi_group_ssd`），但 C++ 层的 `transfer_kv_blocks_ssd` 尚未添加 `ssd_copy_offset` 参数，多组 SSD 传输暂不可用
 - **GDS 多组传输**：框架已搭建，实际验证待进行
-- **Remote/PEER 多组传输**：优先级较低，待后续实现
+- **Lake/PEER 多组传输**：优先级较低，待后续实现
 - **非 BLOCKFIRST 布局**：多组支持仅针对 BLOCKFIRST 实现，LAYERFIRST 的 CPU 端多组传输在 worker 中有基本支持但未充分测试

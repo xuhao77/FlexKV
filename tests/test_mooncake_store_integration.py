@@ -61,11 +61,11 @@ def _make_cache_config(*, with_indexer: bool = False) -> CacheConfig:
         tokens_per_block=16,
         enable_cpu=True,
         enable_ssd=False,
-        enable_remote=True,
+        enable_lake=True,
         use_mooncake_store_backend=True,
         mooncake_store_config_path=_config_path(),
         num_cpu_blocks=64,
-        num_remote_blocks=128,
+        num_lake_blocks=128,
         indexer=indexer,
     )
 
@@ -444,7 +444,7 @@ def test_enable_pool_specs_kv_only_when_indexer_none():
     """Without indexer, only the KV pool is active."""
     cfg = CacheConfig(
         tokens_per_block=16,
-        enable_remote=True,
+        enable_lake=True,
         use_mooncake_store_backend=True,
         mooncake_store_config_path="/tmp/dummy.json",  # not loaded here
         indexer=None,
@@ -458,7 +458,7 @@ def test_enable_pool_specs_includes_indexer_when_configured():
     """Configuring an IndexerCacheConfig must add the INDEXER pool."""
     cfg = CacheConfig(
         tokens_per_block=16,
-        enable_remote=True,
+        enable_lake=True,
         use_mooncake_store_backend=True,
         mooncake_store_config_path="/tmp/dummy.json",
         indexer=IndexerCacheConfig(),

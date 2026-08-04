@@ -19,7 +19,7 @@ import pytest
 
 from flexkv import c_ext
 from flexkv.cache.cache_engine import GlobalCacheEngine
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.transfer import (
     CompletedOp,
@@ -37,13 +37,6 @@ pytestmark = pytest.mark.unit
 TPB = 16
 
 _HAS_REAL_C_EXT = getattr(c_ext, "__file__", None) is not None
-
-INDEX_ACCEL_MODES = [
-    pytest.param(False, id="python-index"),
-    pytest.param(True, id="accel-index",
-                 marks=pytest.mark.skipif(not _HAS_REAL_C_EXT,
-                                          reason="requires compiled c_ext")),
-]
 
 
 def _tokens(num_blocks: int, seed: int) -> np.ndarray:
@@ -235,9 +228,10 @@ NUM_CPU = 128
 NUM_SSD = 1024
 
 
-@pytest.fixture(params=INDEX_ACCEL_MODES)
-def global_engine(request, tmp_path, monkeypatch):
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "index_accel", request.param)
+@pytest.fixture
+def global_engine(tmp_path):
+    if not _HAS_REAL_C_EXT:
+        pytest.skip("requires compiled c_ext")
     model_config = ModelConfig(num_layers=2, num_kv_heads=2, head_size=8,
                                tp_size=1)
     cache_config = CacheConfig(tokens_per_block=TPB,

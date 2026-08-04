@@ -24,15 +24,15 @@ the peer SWA ops into the same ``TransferOpGraph`` as the Full-KV ops.
 Responsibilities (control plane only — no byte movement):
   * Build SWA *peer* ops into the SAME ``TransferOpGraph`` as the full-KV ops,
     with tier dependencies that mirror the full-KV graph exactly. SWA ops reuse
-    the STANDARD transfer types (H2D / D2H / DISK2H / H2DISK / REMOTE2H /
-    H2REMOTE) and carry ``is_swa=True`` so the transfer engine routes them to the
+    the STANDARD transfer types (H2D / D2H / DISK2H / H2DISK / LAKE2H /
+    H2LAKE) and carry ``is_swa=True`` so the transfer engine routes them to the
     dedicated SWA worker; their src/dst block ids are SWA-pool slot ids:
-      - GET: the SWA ``H2D`` depends on the SWA ``DISK2H`` / ``REMOTE2H`` staging
+      - GET: the SWA ``H2D`` depends on the SWA ``DISK2H`` / ``LAKE2H`` staging
         ops; only the terminal SWA ``H2D`` is reported as a finished op (joins
         the VIRTUAL barrier alongside the full-KV ``H2D``).
-      - PUT: the SWA ``H2DISK`` / ``H2REMOTE`` write-through ops depend on the SWA
+      - PUT: the SWA ``H2DISK`` / ``H2LAKE`` write-through ops depend on the SWA
         ``D2H`` but are fire-and-forget (NOT reported), only the SWA ``D2H`` is
-        reported — exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``.
+        reported — exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2LAKE``.
 
 SWA is a first-class PEER op, NOT a child derived from the full-KV op: the
 full-KV ``pending_count`` child model is PP-sibling
@@ -45,7 +45,7 @@ graph stays homogeneous and routing is a single boolean.
 Everything here is gated by ``cache_config.enable_swa_transfer`` (default False):
 until the dedicated SWA transfer worker (data plane) is registered, the build
 helpers are no-ops so an SWA op never reaches the transfer engine. The byte
-movement, kernels, SWA SSD/remote storage and completion callbacks are the data
+movement, kernels, SWA SSD/lake storage and completion callbacks are the data
 plane's responsibility.
 """
 
@@ -61,7 +61,7 @@ from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, Tran
 class SWAPutChainOpIds:
     d2h_id: Optional[int] = None
     h2disk_id: Optional[int] = None
-    h2remote_id: Optional[int] = None
+    h2lake_id: Optional[int] = None
 
 
 class SWAOpConstructor:
@@ -109,7 +109,7 @@ class SWAOpConstructor:
         """Add one peer SWA transfer op (``is_swa=True``) to ``graph``; return op_id.
 
         ``transfer_type`` is a STANDARD type (H2D / D2H / DISK2H / H2DISK /
-        REMOTE2H / H2REMOTE); the ``is_swa`` flag routes it to the SWA worker.
+        LAKE2H / H2LAKE); the ``is_swa`` flag routes it to the SWA worker.
         ``src_slot_ids`` / ``dst_slot_ids`` are SWA-pool slot ids (independent of
         the full-KV block-id space). Returns None (adds nothing) when SWA transfer
         is disabled or the slot arrays are empty, so callers can invoke it
@@ -121,10 +121,10 @@ class SWAOpConstructor:
         dst = np.asarray(dst_slot_ids, dtype=np.int64)
         if src.size == 0 or dst.size == 0:
             return None
-        is_remote = transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H)
+        is_lake = transfer_type in (TransferType.H2LAKE, TransferType.LAKE2H)
         tail_hashes = (
             [str(h) for h in mooncake_tail_hashes]
-            if (is_remote and mooncake_tail_hashes)
+            if (is_lake and mooncake_tail_hashes)
             else None
         )
         op = TransferOp(
@@ -144,7 +144,7 @@ class SWAOpConstructor:
                         gpu_slot_ids: np.ndarray,
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
-                        remote_slot_ids: Optional[np.ndarray] = None,
+                        lake_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
                         mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Build the GET-side SWA load chain into ``graph``; return the terminal
@@ -152,13 +152,13 @@ class SWAOpConstructor:
         joins the VIRTUAL barrier alongside the full-KV H2D).
 
         Mirrors the full-KV GET graph: the SWA ``H2D`` (CPU SWA slot -> GPU swa
-        pool) depends on the staging ops ``DISK2H`` / ``REMOTE2H`` when the SWA
-        bytes are sourced from SSD / REMOTE. (CPU-resident SWA needs no staging
+        pool) depends on the staging ops ``DISK2H`` / ``LAKE2H`` when the SWA
+        bytes are sourced from SSD / LAKE. (CPU-resident SWA needs no staging
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
         when disabled / empty.
 
-        ``mooncake_tail_hashes``: mooncake-store REMOTE tier is key-addressed;
-        the tail hash of the hit block is carried on the SWA ``REMOTE2H`` op.
+        ``mooncake_tail_hashes``: mooncake-store LAKE tier is key-addressed;
+        the tail hash of the hit block is carried on the SWA ``LAKE2H`` op.
         """
         assert gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         h2d_id = self.build_swa_op(
@@ -174,14 +174,14 @@ class SWAOpConstructor:
             )
             if ssd2h_id is not None:
                 graph.add_dependency(h2d_id, ssd2h_id)
-        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
-            remote2h_id = self.build_swa_op(
-                graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
+        if lake_slot_ids is not None and lake_slot_ids.size == cpu_slot_ids.size:
+            lake2h_id = self.build_swa_op(
+                graph, TransferType.LAKE2H, lake_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
                 mooncake_tail_hashes=mooncake_tail_hashes,
             )
-            if remote2h_id is not None:
-                graph.add_dependency(h2d_id, remote2h_id)
+            if lake2h_id is not None:
+                graph.add_dependency(h2d_id, lake2h_id)
         return h2d_id
 
     def build_put_chain(self,
@@ -189,7 +189,7 @@ class SWAOpConstructor:
                         gpu_slot_ids: np.ndarray,
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
-                        remote_slot_ids: Optional[np.ndarray] = None,
+                        lake_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
                         return_op_ids: bool = False,
                         mooncake_tail_hashes: Optional[List[str]] = None
@@ -198,13 +198,13 @@ class SWAOpConstructor:
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
         Mirrors the full-KV PUT graph: the SWA ``D2H`` (GPU swa pool -> CPU SWA
-        slot) is the reported op; the SWA ``H2DISK`` / ``H2REMOTE`` write-through
+        slot) is the reported op; the SWA ``H2DISK`` / ``H2LAKE`` write-through
         ops depend on the SWA ``D2H`` but are fire-and-forget (NOT reported),
-        exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
+        exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2LAKE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
 
-        ``mooncake_tail_hashes``: for the key-addressed mooncake-store REMOTE
-        tier, the sequence tail hash keys the SWA snapshot on ``H2REMOTE``.
+        ``mooncake_tail_hashes``: for the key-addressed mooncake-store LAKE
+        tier, the sequence tail hash keys the SWA snapshot on ``H2LAKE``.
         """
         assert gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
@@ -221,19 +221,19 @@ class SWAOpConstructor:
             )
             if h2ssd_id is not None:
                 graph.add_dependency(h2ssd_id, d2h_id)
-        h2remote_id = None
-        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
-            h2remote_id = self.build_swa_op(
-                graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
+        h2lake_id = None
+        if lake_slot_ids is not None and lake_slot_ids.size == cpu_slot_ids.size:
+            h2lake_id = self.build_swa_op(
+                graph, TransferType.H2LAKE, cpu_slot_ids, lake_slot_ids,
                 dp_client_id=dp_client_id,
                 mooncake_tail_hashes=mooncake_tail_hashes,
             )
-            if h2remote_id is not None:
-                graph.add_dependency(h2remote_id, d2h_id)
+            if h2lake_id is not None:
+                graph.add_dependency(h2lake_id, d2h_id)
         if return_op_ids:
             return SWAPutChainOpIds(
                 d2h_id=d2h_id,
                 h2disk_id=h2ssd_id,
-                h2remote_id=h2remote_id,
+                h2lake_id=h2lake_id,
             )
         return d2h_id

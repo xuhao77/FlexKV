@@ -54,18 +54,18 @@ def test_swa_storage_layout_uses_tier_specific_slot_counts(monkeypatch, tmp_path
         tokens_per_block=16,
         enable_cpu=True,
         enable_ssd=True,
-        enable_3rd_remote=True,
+        enable_3rd_lake=True,
         num_cpu_blocks=64,
         num_ssd_blocks=64,
-        num_remote_blocks=64,
+        num_lake_blocks=64,
         ssd_cache_dir=str(tmp_path / "ssd"),
-        remote_cache_path=str(tmp_path / "remote"),
-        remote_config_custom={"test": True},
+        lake_cache_path=str(tmp_path / "remote"),
+        lake_config_custom={"test": True},
         swa=SWAPoolConfig(
             enabled=True,
             num_slots=3,
             num_ssd_slots=5,
-            num_remote_slots=7,
+            num_lake_slots=7,
             num_swa_layers=2,
             bytes_per_token_per_layer=8,
             pin_memory=False,
@@ -77,9 +77,9 @@ def test_swa_storage_layout_uses_tier_specific_slot_counts(monkeypatch, tmp_path
     layouts = _swa_layout_by_device(allocations)
     assert layouts[DeviceType.CPU].num_block == 3
     assert layouts[DeviceType.SSD].num_block == 5
-    assert layouts[DeviceType.REMOTE].num_block == 7
+    assert layouts[DeviceType.LAKE].num_block == 7
     assert layouts[DeviceType.SSD].tokens_per_block == cache_config.tokens_per_block
-    assert layouts[DeviceType.REMOTE].tokens_per_block == cache_config.tokens_per_block
+    assert layouts[DeviceType.LAKE].tokens_per_block == cache_config.tokens_per_block
 
 
 def test_swa_storage_layout_skips_empty_optional_tiers(monkeypatch, tmp_path):
@@ -88,18 +88,18 @@ def test_swa_storage_layout_skips_empty_optional_tiers(monkeypatch, tmp_path):
         tokens_per_block=16,
         enable_cpu=True,
         enable_ssd=True,
-        enable_3rd_remote=True,
+        enable_3rd_lake=True,
         num_cpu_blocks=64,
         num_ssd_blocks=64,
-        num_remote_blocks=64,
+        num_lake_blocks=64,
         ssd_cache_dir=str(tmp_path / "ssd"),
-        remote_cache_path=str(tmp_path / "remote"),
-        remote_config_custom={"test": True},
+        lake_cache_path=str(tmp_path / "remote"),
+        lake_config_custom={"test": True},
         swa=SWAPoolConfig(
             enabled=True,
             num_slots=3,
             num_ssd_slots=0,
-            num_remote_slots=0,
+            num_lake_slots=0,
             num_swa_layers=2,
             bytes_per_token_per_layer=8,
             pin_memory=False,
@@ -111,4 +111,4 @@ def test_swa_storage_layout_skips_empty_optional_tiers(monkeypatch, tmp_path):
     layouts = _swa_layout_by_device(allocations)
     assert DeviceType.CPU in layouts
     assert DeviceType.SSD not in layouts
-    assert DeviceType.REMOTE not in layouts
+    assert DeviceType.LAKE not in layouts

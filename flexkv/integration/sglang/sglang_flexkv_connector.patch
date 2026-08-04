@@ -2318,7 +2318,7 @@ index 000000000..3c6ceb9b4
 +
 +
 +        # ---- Align block counts on unified group (single all_reduce MIN) ----
-+        for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
++        for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_lake_blocks"):
 +            _orig = getattr(self.flexkv_config.cache_config, _attr)
 +            if _orig is None or _orig <= 0:
 +                continue
@@ -2448,7 +2448,7 @@ index 000000000..3c6ceb9b4
 +        self._ongoing_prefetches: Dict[str, int] = {}
 +        self._prefetch_enabled = bool(
 +            cache_config.enable_ssd
-+            or cache_config.enable_remote
++            or cache_config.enable_lake
 +            or cache_config.enable_kv_sharing
 +        )
 +

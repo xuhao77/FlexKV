@@ -61,7 +61,7 @@ def _model_config():
 def _cache_config(enable_swa_transfer: bool = True):
     cc = CacheConfig(
         tokens_per_block=TPB,
-        enable_cpu=True, enable_ssd=False, enable_remote=False,
+        enable_cpu=True, enable_ssd=False, enable_lake=False,
         num_cpu_blocks=4096,
     )
     cc.swa = SWAPoolConfig(
@@ -82,7 +82,7 @@ def _cache_config_ssd(enable_swa_transfer: bool = True):
     at smoke level without disk I/O."""
     cc = CacheConfig(
         tokens_per_block=TPB,
-        enable_cpu=True, enable_ssd=True, enable_remote=False,
+        enable_cpu=True, enable_ssd=True, enable_lake=False,
         num_cpu_blocks=4096, num_ssd_blocks=4096,
         ssd_cache_dir="./ssd_cache_swa_test",
     )

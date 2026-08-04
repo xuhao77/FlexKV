@@ -18,13 +18,12 @@ import pytest
 
 from flexkv import c_ext
 from flexkv.cache.cache_engine import (
-    CacheEngine,
     CacheEngineAccel,
     GlobalCacheEngine,
     TransferPlanHandle,
 )
 from flexkv.common.block import SequenceMeta
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.transfer import DeviceType
 from flexkv.kvtask import KVTaskManager, TaskStatus
 
@@ -32,20 +31,12 @@ pytestmark = pytest.mark.unit
 
 TPB = 16
 
-# The compiled extension is required for the Accel variants; the pure-Python
-# variants run anywhere. (A stubbed c_ext module has no __file__.)
+# The compiled extension is required by the only engine flavor left.
+# (A stubbed c_ext module has no __file__.)
 _HAS_REAL_C_EXT = getattr(c_ext, "__file__", None) is not None
 
 ENGINE_CLASSES = [
-    pytest.param(CacheEngine, id="CacheEngine"),
     pytest.param(CacheEngineAccel, id="CacheEngineAccel",
-                 marks=pytest.mark.skipif(not _HAS_REAL_C_EXT,
-                                          reason="requires compiled c_ext")),
-]
-
-INDEX_ACCEL_MODES = [
-    pytest.param(False, id="python-index"),
-    pytest.param(True, id="accel-index",
                  marks=pytest.mark.skipif(not _HAS_REAL_C_EXT,
                                           reason="requires compiled c_ext")),
 ]
@@ -162,9 +153,10 @@ NUM_CPU = 128
 NUM_SSD = 1024
 
 
-@pytest.fixture(params=INDEX_ACCEL_MODES)
-def global_engine(request, tmp_path, monkeypatch):
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "index_accel", request.param)
+@pytest.fixture
+def global_engine(tmp_path):
+    if not _HAS_REAL_C_EXT:
+        pytest.skip("requires compiled c_ext")
     model_config = ModelConfig(num_layers=2, num_kv_heads=2, head_size=8,
                                tp_size=1)
     cache_config = CacheConfig(tokens_per_block=TPB,

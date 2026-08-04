@@ -22,7 +22,7 @@ class AccessHandleType(Enum):
 # NOTE: GPU layout depends on the vLLM version's non-MLA KV cache shape:
 #   vLLM <= 0.21: (kv, num_blocks, ...)  -> LAYERFIRST
 #   vLLM >= 0.23: (num_blocks, kv, ...)  -> LAYERBLOCK
-# CPU, SSD, remote layout should be the same, either LAYERFIRST or BLOCKFIRST.
+# CPU, SSD, lake layout should be the same, either LAYERFIRST or BLOCKFIRST.
 class KVCacheLayoutType(Enum):
     LAYERFIRST = "LAYERFIRST"
     BLOCKFIRST = "BLOCKFIRST"
@@ -325,7 +325,7 @@ class StorageHandle:
     # Optional metadata
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
-    remote_config_custom: Optional[Dict[str, Any]] = None
+    lake_config_custom: Optional[Dict[str, Any]] = None
     worker_data: Optional[Any] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:

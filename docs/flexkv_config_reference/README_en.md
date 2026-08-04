@@ -96,7 +96,7 @@ Some configurations can only be set through environment variables.
 |---------------------|------|---------|-------------|
 | `FLEXKV_CPU_LAYOUT` | str | BLOCKFIRST | CPU storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
 | `FLEXKV_SSD_LAYOUT` | str | BLOCKFIRST | SSD storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
-| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKFIRST | REMOTE storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_LAKE_LAYOUT` | str | BLOCKFIRST | LAKE storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
 | `FLEXKV_GDS_LAYOUT` | str | BLOCKFIRST | GDS storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
 
 ---
@@ -184,7 +184,6 @@ Some configurations can only be set through environment variables.
 
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
-| `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-Enable Python version RadixTree implementation, 1-Enable C++ version RadixTree implementation |
 | `FLEXKV_EVICTION_POLICY` | str | "lru" | Cache eviction policy, options: "lru", "lfu", "fifo", "mru", and "filo". "lru" means Least Recently Used, "lfu" means Least Frequently Used, "fifo" means First In First Out, "mru" means Most Recently Used, "filo" means First In Last Out |
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | CPU and SSD eviction ratio for proactive eviction per cycle (0.0 = only evict the minimal necessary blocks). Recommended to keep at `0.05`, i.e., evict 5% of least recently used blocks per cycle |
 | `FLEXKV_EVICT_START_THRESHOLD` | float | 0.7 | Memory utilization threshold to trigger proactive eviction. When the cache utilization reaches this ratio, FlexKV starts evicting nodes proactively. For example, `0.7` means eviction begins when 70% of the cache is occupied. Set to `1.0` to only evict when the cache is full |

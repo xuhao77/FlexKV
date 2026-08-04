@@ -7,14 +7,14 @@ data-plane side can eyeball exactly what it will receive.
 
 Representation (aligned with the data plane): SWA ops are plain ``TransferOp``
 with ``is_swa=True`` and a STANDARD ``transfer_type`` (H2D / D2H / DISK2H /
-H2DISK / REMOTE2H / H2REMOTE). They live in the SAME graph as the full-KV ops; a
+H2DISK / LAKE2H / H2LAKE). They live in the SAME graph as the full-KV ops; a
 VIRTUAL barrier joins the reported ops. SWA ops carry SWA-pool slot ids and are
 tracked in the graph's unified GPU-transfer list; late binding updates their SWA
 slots separately from full-KV block ids.
 
 Tier dependencies mirror the full-KV graph:
-  GET  load:  SWA H2D depends on SWA DISK2H / REMOTE2H staging ops (only H2D reported)
-  PUT  store: SWA H2DISK / H2REMOTE depend on SWA D2H, fire-and-forget (only D2H reported)
+  GET  load:  SWA H2D depends on SWA DISK2H / LAKE2H staging ops (only H2D reported)
+  PUT  store: SWA H2DISK / H2LAKE depend on SWA D2H, fire-and-forget (only D2H reported)
 
 Sandbox note: SWAOpConstructor imports only flexkv.common.* (no torch/c_ext), but
 flexkv.common.block pulls torch, so run in the real env: pytest tests/test_swa_peer_op.py
@@ -80,7 +80,7 @@ def _mgr(enabled=True, cpu=True, ssd=False, remote=False):
     if ssd:
         engines[DeviceType.SSD] = SimpleNamespace(swa_enabled=True)
     if remote:
-        engines[DeviceType.REMOTE] = SimpleNamespace(swa_enabled=True)
+        engines[DeviceType.LAKE] = SimpleNamespace(swa_enabled=True)
     gce = SimpleNamespace(
         cache_engines=engines,
         cache_config=SimpleNamespace(enable_swa_transfer=enabled),
@@ -112,7 +112,7 @@ def _full_d2h(graph, n=2):
 SWA_GPU = np.array([1, 2], dtype=np.int64)
 SWA_CPU = np.array([11, 12], dtype=np.int64)
 SWA_SSD = np.array([21, 22], dtype=np.int64)
-SWA_REMOTE = np.array([31, 32], dtype=np.int64)
+SWA_LAKE = np.array([31, 32], dtype=np.int64)
 
 
 # ============================================================================
@@ -171,18 +171,18 @@ def test_get_full_plus_swa_ssd_staging():
     assert staging[0].op_id in swa_h2d.predecessors
 
 
-def test_get_full_plus_swa_ssd_and_remote_staging():
-    """SWA from SSD+REMOTE: SWA H2D depends on BOTH SWA DISK2H and SWA REMOTE2H."""
+def test_get_full_plus_swa_ssd_and_lake_staging():
+    """SWA from SSD+LAKE: SWA H2D depends on BOTH SWA DISK2H and SWA LAKE2H."""
     mgr = _mgr(enabled=True, ssd=True, remote=True)
     g = TransferOpGraph()
     full = _full_h2d(g)
     swa_id = mgr.build_get_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
-                                 ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE)
+                                 ssd_slot_ids=SWA_SSD, lake_slot_ids=SWA_LAKE)
     g, end = add_virtual_op_for_multiple_finished_ops(g, [full.op_id, swa_id], 0)
-    _print_scenario("GET full + SWA(SSD+REMOTE staging)", g, end)
+    _print_scenario("GET full + SWA(SSD+LAKE staging)", g, end)
     swa_h2d = g._op_map[swa_id]
     dep_types = {g._op_map[p].transfer_type for p in swa_h2d.predecessors}
-    assert dep_types == {TransferType.DISK2H, TransferType.REMOTE2H}
+    assert dep_types == {TransferType.DISK2H, TransferType.LAKE2H}
     assert all(g._op_map[p].is_swa for p in swa_h2d.predecessors)
 
 
@@ -202,7 +202,7 @@ def test_put_full_plus_swa_cpu_only():
     assert len(swa) == 1 and swa[0].transfer_type == TransferType.D2H and swa[0].is_swa
 
 
-def test_put_swa_writethrough_ssd_remote_stays_outside_task_end_barrier():
+def test_put_swa_writethrough_ssd_lake_stays_outside_task_end_barrier():
     """Write-through depends on SWA D2H but remains fire-and-forget.
 
     PUT task completion protects the GPU source lifetime, so it joins the Full
@@ -213,12 +213,12 @@ def test_put_swa_writethrough_ssd_remote_stays_outside_task_end_barrier():
     g = TransferOpGraph()
     full = _full_d2h(g)
     swa_d2h_id = mgr.build_put_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
-                                     ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE)
+                                     ssd_slot_ids=SWA_SSD, lake_slot_ids=SWA_LAKE)
     finished = [full.op_id, swa_d2h_id]
     g, end = add_virtual_op_for_multiple_finished_ops(g, finished, 0)
-    _print_scenario("PUT full + SWA write-through(SSD+REMOTE)", g, end)
+    _print_scenario("PUT full + SWA write-through(SSD+LAKE)", g, end)
     wt = [op for op in _swa_ops(g) if op.op_id != swa_d2h_id]
-    assert {o.transfer_type for o in wt} == {TransferType.H2DISK, TransferType.H2REMOTE}
+    assert {o.transfer_type for o in wt} == {TransferType.H2DISK, TransferType.H2LAKE}
     for o in wt:
         assert o.is_swa and swa_d2h_id in o.predecessors   # depend on SWA D2H
     barrier = g._op_map[end]

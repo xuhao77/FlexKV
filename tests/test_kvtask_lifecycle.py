@@ -238,7 +238,7 @@ def _engine():
     mc = ModelConfig(num_layers=4, num_kv_heads=1, head_size=128,
                      use_mla=True, dtype=torch.bfloat16, tp_size=1, dp_size=1)
     cc = CacheConfig(tokens_per_block=TPB, enable_cpu=True, enable_ssd=False,
-                     enable_remote=False, num_cpu_blocks=4096)
+                     enable_lake=False, num_cpu_blocks=4096)
     cc.swa = SWAPoolConfig(
         enabled=True,
         num_slots=256,

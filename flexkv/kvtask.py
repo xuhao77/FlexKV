@@ -112,8 +112,8 @@ class KVTaskManager:
             raise ValueError("enable_cpu must be True")
         # Mooncake store is a remote backend that does not require local SSD.
         # Keep this aligned with CacheConfig validation in common/config.py.
-        if (cache_config.enable_remote and not cache_config.enable_cpu):
-            raise ValueError("enable_cpu must be True if enable_remote is True")
+        if (cache_config.enable_lake and not cache_config.enable_cpu):
+            raise ValueError("enable_cpu must be True if enable_lake is True")
         if not cache_config.enable_cpu and not cache_config.enable_gds:
             raise ValueError("enable_gds must be True if enable_cpu is False")
         if cache_config.enable_gds and not cache_config.enable_ssd:

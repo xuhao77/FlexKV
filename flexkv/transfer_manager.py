@@ -250,9 +250,9 @@ class TransferManager:
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
         use_mooncake_store = self.cache_config.use_mooncake_store_backend
-        remote_handle = (
-            self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote and not use_mooncake_store \
+        lake_handle = (
+            self.storage_engine.get_storage_handle(DeviceType.LAKE) \
+            if self.cache_config.enable_lake and not use_mooncake_store \
             else None
         )
         # Group SWA GPU handles by WorkerKey, mirroring the main-KV grouping,
@@ -290,9 +290,9 @@ class TransferManager:
          if self.storage_engine.has_storage_handle(DeviceType.SSD, is_swa=True)
          else None
          )
-        swa_remote_handle = (
-         self.storage_engine.get_storage_handle(DeviceType.REMOTE, is_swa=True)
-         if self.storage_engine.has_storage_handle(DeviceType.REMOTE, is_swa=True)
+        swa_lake_handle = (
+         self.storage_engine.get_storage_handle(DeviceType.LAKE, is_swa=True)
+         if self.storage_engine.has_storage_handle(DeviceType.LAKE, is_swa=True)
          else None
          )
 
@@ -302,13 +302,13 @@ class TransferManager:
             cache_config=self.cache_config,
             cpu_handle=cpu_handle,
             ssd_handle=ssd_handle,
-            remote_handle=remote_handle,
+            lake_handle=lake_handle,
             gpu_blocks_per_group=grouped_gpu_blocks_per_group,
             gpu_layouts_per_group=grouped_gpu_layouts_per_group,
             swa_gpu_handles=swa_gpu_handles,
             swa_cpu_handle=swa_cpu_handle,
             swa_ssd_handle=swa_ssd_handle,
-            swa_remote_handle=swa_remote_handle,
+            swa_lake_handle=swa_lake_handle,
             swa_layer_groups=self.swa_layer_groups,
             swa_gpu_blocks_per_group=swa_grouped_gpu_blocks_per_group,
             swa_gpu_layouts_per_group=swa_grouped_gpu_layouts_per_group,

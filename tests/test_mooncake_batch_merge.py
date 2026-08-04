@@ -8,7 +8,7 @@ the mooncake SDK:
 * ``_merge_ops`` / ``_merge_swa_ops`` — hash preservation, mix rejection.
 * ``merge_to_batch_graph`` — 12-bucket layout (main+SWA × 6 transfer types),
   mooncake dependency edges, ``batch_end_op_id`` VIRTUAL-sink semantics.
-* Layerwise + mooncake coexistence: REMOTE2H stays standalone and is a
+* Layerwise + mooncake coexistence: LAKE2H stays standalone and is a
   predecessor of the fused LAYERWISE op (prefetch before H2D).
 """
 from __future__ import annotations
@@ -88,10 +88,10 @@ class TestMergeMainKvOps:
     def test_hash_concat_in_block_order(self):
         g = TransferOpGraph(); g.set_graph_id(0)
         ops = [
-            _mk_op(TransferType.H2REMOTE, [0, 1], [0, 0], kv_hashes=["a0", "a1"]),
-            _mk_op(TransferType.H2REMOTE, [2], [0], kv_hashes=["b0"]),
+            _mk_op(TransferType.H2LAKE, [0, 1], [0, 0], kv_hashes=["a0", "a1"]),
+            _mk_op(TransferType.H2LAKE, [2], [0], kv_hashes=["b0"]),
         ]
-        merged = _merge_ops(ops, TransferType.H2REMOTE, g, [], {})
+        merged = _merge_ops(ops, TransferType.H2LAKE, g, [], {})
         assert merged is not None
         np.testing.assert_array_equal(
             merged.src_block_ids, np.array([0, 1, 2], dtype=np.int64))
@@ -107,11 +107,11 @@ class TestMergeMainKvOps:
     def test_mix_hash_and_no_hash_raises(self):
         g = TransferOpGraph(); g.set_graph_id(0)
         ops = [
-            _mk_op(TransferType.H2REMOTE, [0], [0], kv_hashes=["a0"]),
-            _mk_op(TransferType.H2REMOTE, [1], [0]),  # no hash
+            _mk_op(TransferType.H2LAKE, [0], [0], kv_hashes=["a0"]),
+            _mk_op(TransferType.H2LAKE, [1], [0]),  # no hash
         ]
         with pytest.raises(ValueError, match="cannot merge mooncake and non-mooncake"):
-            _merge_ops(ops, TransferType.H2REMOTE, g, [], {})
+            _merge_ops(ops, TransferType.H2LAKE, g, [], {})
 
     def test_swa_op_rejected(self):
         g = TransferOpGraph(); g.set_graph_id(0)
@@ -124,8 +124,8 @@ class TestMergeMainKvOps:
         g = TransferOpGraph(); g.set_graph_id(0)
         with pytest.raises(ValueError, match="mooncake_store_swa_block_hashes"):
             _merge_ops(
-                [_mk_op(TransferType.H2REMOTE, [0], [0], swa_hashes=["x"])],
-                TransferType.H2REMOTE, g, [], {})
+                [_mk_op(TransferType.H2LAKE, [0], [0], swa_hashes=["x"])],
+                TransferType.H2LAKE, g, [], {})
 
 
 # --------------------------------------------------------------------------
@@ -146,27 +146,27 @@ class TestMergeSwaOps:
             merged.src_block_ids, np.array([4, 9], dtype=np.int64))
         assert merged.mooncake_store_swa_block_hashes is None
 
-    def test_remote_lane_hash_concat(self):
+    def test_lake_lane_hash_concat(self):
         g = TransferOpGraph(); g.set_graph_id(0)
         ops = [
-            _mk_op(TransferType.H2REMOTE, [4], [0], is_swa=True, swa_hashes=["tx"]),
-            _mk_op(TransferType.H2REMOTE, [9], [0], is_swa=True, swa_hashes=["ty"]),
+            _mk_op(TransferType.H2LAKE, [4], [0], is_swa=True, swa_hashes=["tx"]),
+            _mk_op(TransferType.H2LAKE, [9], [0], is_swa=True, swa_hashes=["ty"]),
         ]
-        merged = _merge_swa_ops(ops, TransferType.H2REMOTE, g, [], {})
+        merged = _merge_swa_ops(ops, TransferType.H2LAKE, g, [], {})
         assert merged is not None
         assert merged.is_swa is True
         assert merged.mooncake_store_swa_block_hashes == ["tx", "ty"]
 
-    def test_remote_lane_missing_hash_raises(self):
+    def test_lake_lane_missing_hash_raises(self):
         g = TransferOpGraph(); g.set_graph_id(0)
-        ops = [_mk_op(TransferType.H2REMOTE, [0], [0], is_swa=True)]  # no hash
+        ops = [_mk_op(TransferType.H2LAKE, [0], [0], is_swa=True)]  # no hash
         with pytest.raises(ValueError, match="missing mooncake_store_swa_block_hashes"):
-            _merge_swa_ops(ops, TransferType.H2REMOTE, g, [], {})
+            _merge_swa_ops(ops, TransferType.H2LAKE, g, [], {})
 
     def test_local_lane_carrying_hash_rejected(self):
         g = TransferOpGraph(); g.set_graph_id(0)
         ops = [_mk_op(TransferType.H2D, [0], [0], is_swa=True, swa_hashes=["x"])]
-        with pytest.raises(ValueError, match="only allowed on H2REMOTE / REMOTE2H"):
+        with pytest.raises(ValueError, match="only allowed on H2LAKE / LAKE2H"):
             _merge_swa_ops(ops, TransferType.H2D, g, [], {})
 
     def test_non_swa_rejected(self):
@@ -177,10 +177,10 @@ class TestMergeSwaOps:
 
     def test_carrying_main_kv_hash_rejected(self):
         g = TransferOpGraph(); g.set_graph_id(0)
-        ops = [_mk_op(TransferType.H2REMOTE, [0], [0], is_swa=True,
+        ops = [_mk_op(TransferType.H2LAKE, [0], [0], is_swa=True,
                       kv_hashes=["should_not_be_here"])]
         with pytest.raises(ValueError, match="unexpected mooncake_store_block_hashes"):
-            _merge_swa_ops(ops, TransferType.H2REMOTE, g, [], {})
+            _merge_swa_ops(ops, TransferType.H2LAKE, g, [], {})
 
 
 # --------------------------------------------------------------------------
@@ -192,36 +192,36 @@ def _find_virtual(graph: TransferOpGraph) -> List[TransferOp]:
 
 
 class TestBatchMergeMooncakeDependencies:
-    def test_get_remote2h_gates_h2d(self):
-        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], kv_hashes=["h"])
+    def test_get_lake2h_gates_h2d(self):
+        r2h = _mk_op(TransferType.LAKE2H, [0], [0], kv_hashes=["h"])
         h2d = _mk_op(TransferType.H2D, [0], [0])
         merged, _, _ = merge_to_batch_graph(1, [_graph_of([r2h, h2d])], [-1], {})
         (m_h2d,) = _find_ops(merged, transfer_type=TransferType.H2D)
-        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H)
+        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.LAKE2H)
         assert m_r2h.op_id in m_h2d.predecessors
 
-    def test_put_d2h_gates_h2remote(self):
+    def test_put_d2h_gates_h2lake(self):
         d2h = _mk_op(TransferType.D2H, [0], [0])
-        h2r = _mk_op(TransferType.H2REMOTE, [0], [0], kv_hashes=["h"])
+        h2r = _mk_op(TransferType.H2LAKE, [0], [0], kv_hashes=["h"])
         merged, _, _ = merge_to_batch_graph(1, [_graph_of([d2h, h2r])], [-1], {})
         (m_d2h,) = _find_ops(merged, transfer_type=TransferType.D2H)
-        (m_h2r,) = _find_ops(merged, transfer_type=TransferType.H2REMOTE)
+        (m_h2r,) = _find_ops(merged, transfer_type=TransferType.H2LAKE)
         assert m_d2h.op_id in m_h2r.predecessors
 
-    def test_swa_get_remote2h_gates_swa_h2d(self):
-        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], is_swa=True, swa_hashes=["t"])
+    def test_swa_get_lake2h_gates_swa_h2d(self):
+        r2h = _mk_op(TransferType.LAKE2H, [0], [0], is_swa=True, swa_hashes=["t"])
         h2d = _mk_op(TransferType.H2D, [0], [0], is_swa=True)
         merged, _, _ = merge_to_batch_graph(1, [_graph_of([r2h, h2d])], [-1], {})
         (m_h2d,) = _find_ops(merged, transfer_type=TransferType.H2D, is_swa=True)
-        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=True)
+        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.LAKE2H, is_swa=True)
         assert m_r2h.op_id in m_h2d.predecessors
 
-    def test_swa_put_d2h_gates_swa_h2remote(self):
+    def test_swa_put_d2h_gates_swa_h2lake(self):
         d2h = _mk_op(TransferType.D2H, [0], [0], is_swa=True)
-        h2r = _mk_op(TransferType.H2REMOTE, [0], [0], is_swa=True, swa_hashes=["t"])
+        h2r = _mk_op(TransferType.H2LAKE, [0], [0], is_swa=True, swa_hashes=["t"])
         merged, _, _ = merge_to_batch_graph(1, [_graph_of([d2h, h2r])], [-1], {})
         (m_d2h,) = _find_ops(merged, transfer_type=TransferType.D2H, is_swa=True)
-        (m_h2r,) = _find_ops(merged, transfer_type=TransferType.H2REMOTE, is_swa=True)
+        (m_h2r,) = _find_ops(merged, transfer_type=TransferType.H2LAKE, is_swa=True)
         assert m_d2h.op_id in m_h2r.predecessors
 
 
@@ -269,40 +269,40 @@ class TestBatchEndOpIdVirtualSink:
         assert m_d2h.op_id in sink.predecessors
         assert m_swa_d2h.op_id in sink.predecessors
 
-    def test_prefetch_only_remote2h_single_terminal(self):
+    def test_prefetch_only_lake2h_single_terminal(self):
         # Only mooncake staging present (no H2D / D2H). end -> the remote op.
-        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], kv_hashes=["h"])
+        r2h = _mk_op(TransferType.LAKE2H, [0], [0], kv_hashes=["h"])
         merged, end, _ = merge_to_batch_graph(1, [_one_op_graph(r2h)], [-1], {})
         assert not _find_virtual(merged)
-        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H)
+        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.LAKE2H)
         assert end == m_r2h.op_id
 
-    def test_prefetch_main_and_swa_remote2h_virtual_sink(self):
-        # Prefetch with both full-KV and SWA REMOTE2H (no H2D): batch end must
+    def test_prefetch_main_and_swa_lake2h_virtual_sink(self):
+        # Prefetch with both full-KV and SWA LAKE2H (no H2D): batch end must
         # wait for BOTH leaves, not just the first one found.
-        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], kv_hashes=["h"])
-        swa_r2h = _mk_op(TransferType.REMOTE2H, [0], [0], is_swa=True, swa_hashes=["t"])
+        r2h = _mk_op(TransferType.LAKE2H, [0], [0], kv_hashes=["h"])
+        swa_r2h = _mk_op(TransferType.LAKE2H, [0], [0], is_swa=True, swa_hashes=["t"])
         merged, end, _ = merge_to_batch_graph(
             1, [_graph_of([r2h, swa_r2h])], [-1], {})
         (sink,) = _find_virtual(merged)
         assert end == sink.op_id
-        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=False)
-        (m_swa_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=True)
+        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.LAKE2H, is_swa=False)
+        (m_swa_r2h,) = _find_ops(merged, transfer_type=TransferType.LAKE2H, is_swa=True)
         assert m_r2h.op_id in sink.predecessors
         assert m_swa_r2h.op_id in sink.predecessors
 
-    def test_put_no_d2h_h2disk_and_h2remote_virtual_sink(self):
+    def test_put_no_d2h_h2disk_and_h2lake_virtual_sink(self):
         # Degenerate PUT without D2H: both leaf lanes must be terminals.
         h2disk = _mk_op(TransferType.H2DISK, [0], [0])
-        h2remote = _mk_op(TransferType.H2REMOTE, [0], [0], kv_hashes=["h"])
+        h2lake = _mk_op(TransferType.H2LAKE, [0], [0], kv_hashes=["h"])
         merged, end, _ = merge_to_batch_graph(
-            1, [_graph_of([h2disk, h2remote])], [-1], {})
+            1, [_graph_of([h2disk, h2lake])], [-1], {})
         (sink,) = _find_virtual(merged)
         assert end == sink.op_id
         (m_disk,) = _find_ops(merged, transfer_type=TransferType.H2DISK)
-        (m_remote,) = _find_ops(merged, transfer_type=TransferType.H2REMOTE)
+        (m_lake,) = _find_ops(merged, transfer_type=TransferType.H2LAKE)
         assert m_disk.op_id in sink.predecessors
-        assert m_remote.op_id in sink.predecessors
+        assert m_lake.op_id in sink.predecessors
 
 
 # --------------------------------------------------------------------------
@@ -311,20 +311,20 @@ class TestBatchEndOpIdVirtualSink:
 
 class TestLayerwiseMooncakeCoexistence:
     def test_mooncake_r2h_stays_standalone_with_layerwise_h2d(self):
-        # Batch has both: mooncake REMOTE2H (prefetch stage) AND layerwise H2D
+        # Batch has both: mooncake LAKE2H (prefetch stage) AND layerwise H2D
         # (layerwise stage). Expect: LAYERWISE op fuses local DISK2H+H2D+SWA,
-        # while REMOTE2H remains as an independent op in the merged graph.
-        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], kv_hashes=["h"])
+        # while LAKE2H remains as an independent op in the merged graph.
+        r2h = _mk_op(TransferType.LAKE2H, [0], [0], kv_hashes=["h"])
         h2d = _mk_op(TransferType.H2D, [0], [0])
         merged, end, _ = merge_to_batch_graph(
             1, [_graph_of([r2h, h2d])], [-1], {}, layerwise_transfer=True)
         # LAYERWISE op exists.
         lw_ops = _find_ops(merged, transfer_type=TransferType.LAYERWISE)
         assert len(lw_ops) == 1
-        # REMOTE2H still standalone (not folded).
-        r2h_ops = _find_ops(merged, transfer_type=TransferType.REMOTE2H)
+        # LAKE2H still standalone (not folded).
+        r2h_ops = _find_ops(merged, transfer_type=TransferType.LAKE2H)
         assert len(r2h_ops) == 1
-        # LAYERWISE depends on REMOTE2H (prefetch-before-H2D); end is LAYERWISE.
+        # LAYERWISE depends on LAKE2H (prefetch-before-H2D); end is LAYERWISE.
         assert r2h_ops[0].op_id in lw_ops[0].predecessors
         assert end == lw_ops[0].op_id
         assert not _find_virtual(merged)
@@ -340,15 +340,15 @@ class TestLayerwiseMooncakeCoexistence:
         assert end == lw_ops[0].op_id
 
     def test_swa_mooncake_r2h_stays_standalone_with_layerwise(self):
-        # Layerwise + SWA REMOTE2H mooncake. LAYERWISE handles local SWA H2D;
-        # SWA REMOTE2H stands alone.
-        swa_r2h = _mk_op(TransferType.REMOTE2H, [0], [0], is_swa=True, swa_hashes=["t"])
+        # Layerwise + SWA LAKE2H mooncake. LAYERWISE handles local SWA H2D;
+        # SWA LAKE2H stands alone.
+        swa_r2h = _mk_op(TransferType.LAKE2H, [0], [0], is_swa=True, swa_hashes=["t"])
         swa_h2d = _mk_op(TransferType.H2D, [0], [0], is_swa=True)
         merged, end, _ = merge_to_batch_graph(
             1, [_graph_of([swa_r2h, swa_h2d])], [-1], {}, layerwise_transfer=True)
         lw_ops = _find_ops(merged, transfer_type=TransferType.LAYERWISE)
         assert len(lw_ops) == 1
-        swa_r2h_ops = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=True)
+        swa_r2h_ops = _find_ops(merged, transfer_type=TransferType.LAKE2H, is_swa=True)
         assert len(swa_r2h_ops) == 1
         assert swa_r2h_ops[0].op_id in lw_ops[0].predecessors
         assert end == lw_ops[0].op_id

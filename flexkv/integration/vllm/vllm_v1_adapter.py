@@ -228,7 +228,7 @@ class FlexKVSchedulerConnector:
 
         # only support local batching for now
         self.enable_batch = (not self.cache_config.enable_kv_sharing
-                             and not self.cache_config.enable_remote
+                             and not self.cache_config.enable_lake
                              and not self.cache_config.enable_gds)
 
         while not self.is_ready():

@@ -14,22 +14,19 @@
 # limitations under the License.
 
 import logging
-import threading
 import time
 from functools import partial
-from queue import Queue
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import Any, List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 import nvtx
 import torch
-from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
+from flexkv.c_ext import CRadixNode, CRadixTreeIndex
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
-from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
@@ -45,11 +42,11 @@ from flexkv.common.debug import (
     flexkv_logger,
     summarize_id_tensor,
 )
-from flexkv.common.type import MatchResultAccel
+from flexkv.common.type import CacheEngineLike, MatchResultAccel, RadixNodeLike
 from flexkv.integration.dynamo.collector import KVEventCollector
-from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
+from flexkv.metrics import init_global_collector, get_global_collector
 
-DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
+DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'LAKE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
 
 
@@ -110,8 +107,8 @@ class SWAReadSource:
     node: Optional[object] = None
     device_type: Optional[DeviceType] = None
     engine: Optional[object] = None
-    # Key-addressed REMOTE tier (mooncake-store): the tail hash of the hit
-    # block is the sole remote handle — no radix node / host slot exists on
+    # Key-addressed LAKE tier (mooncake-store): the tail hash of the hit
+    # block is the sole lake handle — no radix node / host slot exists on
     # that tier, so pin / unlock / evict do not apply to the source.
     mooncake_tail_hash: Optional[str] = None
 
@@ -124,7 +121,7 @@ class SWAReadSource:
         if self.hit_blocks <= 0 or self.device_type is None:
             return False
         if self.is_mooncake:
-            return self.device_type == DeviceType.REMOTE
+            return self.device_type == DeviceType.LAKE
         return self.host_slot >= 0 and self.node is not None
 
 
@@ -327,7 +324,7 @@ class CacheEngineAccel:
             last_node_matched_length=match_result.last_node_matched_length,
             physical_blocks=phys,
             block_node_ids=bnids_np,
-            matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
+            matched_pos="remote" if self.device_type == DeviceType.LAKE else "local",
             # SWA node-mount: carry the SWA hit found on the SAME forward pass so
             # the SWA-aware get can reuse it (no second match_prefix walk).
             last_swa_node=getattr(match_result, "last_swa_node", None),
@@ -498,300 +495,34 @@ class CacheEngineAccel:
             self.recycle(freed.numpy())
         return num_freed
 
-class CacheEngine:
-    def __init__(self,
-                 device_type: DeviceType,
-                 num_total_blocks: int,
-                 tokens_per_block: int,
-                 evict_ratio: float,
-                 hit_reward_seconds: int = 0,
-                 evict_start_threshold: float = 1.0,
-                 eviction_policy: str = "lru",
-                 event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None,
-                 protected_threshold = 2,
-                 swa_config: Optional["SWAPoolConfig"] = None):
-        if not isinstance(device_type, DeviceType):
-            raise ValueError(f"Unknown device type: {device_type}")
-        if num_total_blocks <= 0:
-            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
-        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
-                              f"tokens_per_block must be a power of 2")
-        if eviction_policy not in _VALID_EVICTION_POLICIES:
-            raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
-                              f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
-        if not isinstance(protected_threshold, int) or protected_threshold < 1:
-            raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
-                              f"protected_threshold must be an integer >= 1")
-
-        self.device_type = device_type
-
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block,
-                                    hit_reward_seconds=hit_reward_seconds,
-                                    eviction_policy=eviction_policy,
-                                    protected_threshold=protected_threshold)
-
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
-
-        self.tokens_per_block = tokens_per_block
-        self.num_total_blocks = num_total_blocks
-        self.evict_ratio = evict_ratio
-        self.evict_start_threshold = evict_start_threshold
-
-        self.event_collector = event_collector
-        self._metrics_collector = metrics_collector
-
-        # Legacy Python mirror. Keep the SWA helpers local to this class; the
-        # C++ CacheEngineAccel path is the maintained path.
-        self.swa_pool = None
-        self.tier_swa_config = (swa_config.for_cache_tier(device_type)
-                           if swa_config is not None else None)
-        if self.tier_swa_config is not None:
-            self.init_swa(self.tier_swa_config)
-
-    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
-        """Initialize the SWA host pool for node-mounted SWA on this engine."""
-        from flexkv.swa.swa_host_pool import SWAHostPool
-        self.swa_pool = SWAHostPool(swa_config)
-
-    @property
-    def swa_enabled(self) -> bool:
-        return self.tier_swa_config is not None and self.tier_swa_config.enabled \
-               and self.swa_pool is not None
-
-    def _alloc_swa_slot(self, protected_node=None) -> int:
-        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
-        if self.swa_pool is None:
-            return -1
-        slot = self.swa_pool.allocate()
-        if slot is not None:
-            return slot
-        if protected_node is not None:
-            self.lock_node(protected_node)
-        try:
-            self._evict_swa_slots(1)
-        finally:
-            if protected_node is not None:
-                self.unlock(protected_node)
-        slot = self.swa_pool.allocate()
-        return slot if slot is not None else -1
-
-    def _free_swa_slot(self, slot: int) -> None:
-        """Return one detached SWA slot to this tier's pool."""
-        self.swa_pool.free(int(slot))
-
-    def _drain_unmounted_swa_slots(self) -> None:
-        """Return slots detached by radix-tree structural changes to the pool."""
-        if self.swa_pool is None:
-            return
-        for slot in self.index.drain_freed_swa_slots():
-            self._free_swa_slot(slot)
-
-    def _pin_swa_node(self, node) -> None:
-        self.index.lock(node)
-        try:
-            node.inc_swa_lock_ref()
-        except Exception:
-            self.index.unlock(node)
-            raise
-
-    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
-        """Evict node-mounted SWA slots through the Python radix tree."""
-        if self.swa_pool is None:
-            return 0
-        free_before = self.swa_pool.num_free
-        start_ns = time.perf_counter_ns()
-        evicted_full, num_freed = self.index.evict_swa(num_swa_evicted)
-        if evicted_full.size > 0:
-            self.mempool.recycle_blocks(evicted_full)
-        self._drain_unmounted_swa_slots()
-        free_after = self.swa_pool.num_free
-        eviction_log_aggregator.record(
-            tier=DEVICE_TYPE[self.device_type].lower(),
-            scope="swa",
-            reason="capacity",
-            requested_blocks=num_swa_evicted,
-            required_blocks=num_swa_evicted,
-            evicted_blocks=num_freed,
-            free_blocks_before=free_before,
-            free_blocks_after=free_after,
-            total_blocks=self.swa_pool.num_slots,
-            duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
-            target_met=num_freed >= num_swa_evicted,
-        )
-        return num_freed
-
-    def reset(self) -> None:
-        self.index.reset()
-        self.mempool.reset()
-        if self.swa_pool is not None:
-            self.swa_pool.reset()
-
-    def match(self, sequence_meta: SequenceMeta) -> MatchResult:
-        match_result = self.index.match_prefix(sequence_meta,
-                                              update_cache_info=True)
-        return match_result
-
-    def insert(self,
-               sequence_meta: SequenceMeta,
-               physical_block_ids: np.ndarray,
-               num_insert_blocks: int = -1,
-               is_ready: bool = True,
-               match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
-        node = self.index.insert(sequence_meta,
-                                 physical_block_ids,
-                                 num_insert_blocks=num_insert_blocks,
-                                 is_ready=is_ready,
-                                 match_result=match_result)
-        if self.event_collector is not None:
-            self.event_collector.publish_stored(
-                block_hashes=sequence_meta.block_hashes[:None if num_insert_blocks == -1 else num_insert_blocks],
-                                                block_size=self.tokens_per_block,
-                                                medium=DEVICE_TYPE[self.device_type])
-        return node
-
-    def lock_node(self, node: RadixNode) -> None:
-        self.index.lock(node)
-
-    def unlock(self, node: RadixNode) -> None:
-        self.index.unlock(node)
-
-    def set_ready(self, node: RadixNode, ready: bool, ready_length: int) -> None:
-        self.index.set_ready(node, ready, ready_length)
-
-    def take(self,
-             num_required_blocks: int,
-             protected_node: Optional[RadixNode] = None,
-             strict: bool = True) -> np.ndarray:
-        # Calculate current utilization
-        utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
-                       / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
-
-        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
-        should_evict = (utilization >= self.evict_start_threshold) or \
-            (num_required_blocks > self.mempool.num_free_blocks)
-
-        if should_evict:
-            if protected_node is not None:
-                self.index.lock(protected_node)
-
-            # Calculate how many blocks to evict
-            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
-            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
-            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-
-            evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
-                evict_to_reach_target,                               # Or reach target free ratio
-                # Or minimum evict_ratio
-                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0
-            )
-            if evict_block_num > 0:
-                free_before = self.mempool.num_free_blocks
-                start_ns = time.perf_counter_ns()
-                evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
-                self.mempool.recycle_blocks(evicted_blocks)
-
-                # SWA node-mount: return connected-freed SWA slots to the pool (I1).
-                self._drain_unmounted_swa_slots()
-
-                # Record eviction metrics
-                if self._metrics_collector is not None and len(evicted_blocks) > 0:
-                    self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), len(evicted_blocks))
-
-                if self.event_collector is not None:
-                    self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
-                                                         medium=DEVICE_TYPE[self.device_type])
-                free_after = self.mempool.num_free_blocks
-                target_met = free_after >= max(
-                    num_required_blocks, target_free_blocks
-                )
-                sample_block_hashes = None
-                batch_level = logging.DEBUG if target_met else logging.WARNING
-                if flexkv_logger.is_enabled_for(batch_level):
-                    sample_block_hashes = [
-                        format_block_hash(value)
-                        for value in evicted_block_hashes[:3].tolist()
-                    ]
-                eviction_log_aggregator.record(
-                    tier=DEVICE_TYPE[self.device_type].lower(),
-                    scope="full",
-                    reason=(
-                        "capacity"
-                        if num_required_blocks > free_before
-                        else "threshold"
-                    ),
-                    requested_blocks=num_required_blocks,
-                    required_blocks=evict_block_num,
-                    evicted_blocks=len(evicted_blocks),
-                    free_blocks_before=free_before,
-                    free_blocks_after=free_after,
-                    total_blocks=self.mempool.num_total_blocks,
-                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
-                    sample_block_hashes=sample_block_hashes,
-                    target_met=target_met,
-                )
-            if protected_node is not None:
-                self.index.unlock(protected_node)
-
-        if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise RuntimeError("Not enough free blocks to take, ",
-                               f"required: {num_required_blocks}, "
-                               f"available: {self.mempool.num_free_blocks}")
-        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-
-        # Record allocation metrics
-        if self._metrics_collector is not None and num_allocated_blocks > 0:
-            self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-
-        return allocated_blocks
-
-    def recycle(self, physical_blocks: np.ndarray) -> None:
-        self.mempool.recycle_blocks(physical_blocks)
-        self._drain_unmounted_swa_slots()
-
-    def rollback_unready_insert(self, node: Optional[RadixNode]) -> int:
-        """Undo an ``is_ready=False`` insert whose completion callback will
-        never run (plan aborted before launch). No-op for ready nodes, so it is
-        safe to call on every entry of a plan's node_to_unlock: only nodes this
-        plan inserted are unready. Recycles the freed blocks."""
-        if node is None:
-            return 0
-        freed = self.index.remove_unready_leaf(node)
-        if freed.size > 0:
-            self.recycle(freed)
-        return int(freed.size)
-
 @dataclass
 class CacheStrategy:
     # if True, will not put or get blocks from GPU
     ignore_gpu: bool = False
     # if True, will not put or get blocks from SSD
     ignore_ssd: bool = False
-    # if True, will not get blocks from REMOTE
-    ignore_remote: bool = False
+    # if True, will not get blocks from LAKE
+    ignore_lake: bool = False
     # if True, will not use GDS
     ignore_gds: bool = False
 
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
-CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
+CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_lake=True, ignore_gds=True)
 
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
+        cache_config.validate_lake_p2p_exclusive()
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
 
-        self.cpu_cache_engine = None
-        self.ssd_cache_engine = None
-        self.remote_cache_engine = None
+        self.cpu_cache_engine: Optional[CacheEngineLike[Any]] = None
+        self.ssd_cache_engine: Optional[CacheEngineLike[Any]] = None
+        self.lake_cache_engine: Optional[CacheEngineLike[Any]] = None
         self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
 
-        self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
             assert redis_meta is not None
             self.redis_meta = redis_meta
@@ -799,7 +530,7 @@ class GlobalCacheEngine:
             self.enable_kv_sharing = True
         else:
             self.enable_kv_sharing = False
-        self.cache_engines = {}
+        self.cache_engines: Dict[DeviceType, Optional[CacheEngineLike[Any]]] = {}
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
@@ -815,7 +546,7 @@ class GlobalCacheEngine:
         need_dist = (
             (cache_config.enable_cpu and cache_config.enable_p2p_cpu)
             or (cache_config.enable_ssd and cache_config.enable_p2p_ssd)
-            or (cache_config.enable_remote and cache_config.enable_kv_sharing)
+            or (cache_config.enable_lake and cache_config.enable_kv_sharing)
         )
         if need_dist and not dist_available():
             raise RuntimeError(
@@ -828,22 +559,8 @@ class GlobalCacheEngine:
             if cache_config.enable_p2p_cpu:
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(
                     cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
-            elif self.index_accel:
-                self.cpu_cache_engine = CacheEngineAccel(
-                    device_type=DeviceType.CPU,
-                    num_total_blocks=cache_config.num_cpu_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
             else:
-                self.cpu_cache_engine = CacheEngine(
+                self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
                     num_total_blocks=cache_config.num_cpu_blocks,
                     tokens_per_block=cache_config.tokens_per_block,
@@ -861,7 +578,7 @@ class GlobalCacheEngine:
             if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(
                     cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
-            elif self.index_accel:
+            else:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
                     num_total_blocks=cache_config.num_ssd_blocks,
@@ -875,49 +592,21 @@ class GlobalCacheEngine:
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
                 )
-            else:
-                self.ssd_cache_engine = CacheEngine(
-                    device_type=DeviceType.SSD,
-                    num_total_blocks=cache_config.num_ssd_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
-        if cache_config.enable_remote:
+        if cache_config.enable_lake:
             if self.use_mooncake_store_backend:
                 from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
-                self.remote_cache_engine = MooncakeStoreCacheEngine(
+                self.lake_cache_engine = MooncakeStoreCacheEngine(
                     cache_config=cache_config,
                 )
             elif cache_config.enable_kv_sharing:
-                # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(
-                    cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
-            elif self.index_accel:
-                self.remote_cache_engine = CacheEngineAccel(
-                    device_type=DeviceType.REMOTE,
-                    num_total_blocks=cache_config.num_remote_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=None,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
+                # Build the PCFS cache engine directly from CacheConfig.
+                self.lake_cache_engine = HierarchyLRCacheEngine.from_cache_config(
+                    cache_config, self.node_id, DeviceType.LAKE, meta=self.redis_meta)
             else:
-                self.remote_cache_engine = CacheEngine(
-                    device_type=DeviceType.REMOTE,
-                    num_total_blocks=cache_config.num_remote_blocks,
+                self.lake_cache_engine = CacheEngineAccel(
+                    device_type=DeviceType.LAKE,
+                    num_total_blocks=cache_config.num_lake_blocks,
                     tokens_per_block=cache_config.tokens_per_block,
                     evict_ratio=self.evict_ratio,
                     hit_reward_seconds=self.hit_reward_seconds,
@@ -928,7 +617,7 @@ class GlobalCacheEngine:
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
                 )
-            self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
+            self.cache_engines[DeviceType.LAKE] = self.lake_cache_engine
 
         # SWA peer-op builder. Per-tier match/slot resolution is fused into the
         # Full-KV get/put implementations; this helper only appends SWA ops.
@@ -950,16 +639,16 @@ class GlobalCacheEngine:
             self.cpu_cache_engine.start()
         if self.ssd_cache_engine and self.cache_config.enable_p2p_ssd:
             self.ssd_cache_engine.start()
-        if self.remote_cache_engine and self.cache_config.enable_3rd_remote:
-            self.remote_cache_engine.start()
+        if self.lake_cache_engine and self.cache_config.enable_3rd_lake:
+            self.lake_cache_engine.start()
 
     def reset(self) -> None:
         if self.cpu_cache_engine:
             self.cpu_cache_engine.reset()
         if self.ssd_cache_engine:
             self.ssd_cache_engine.reset()
-        if self.remote_cache_engine:
-            self.remote_cache_engine.reset()
+        if self.lake_cache_engine:
+            self.lake_cache_engine.reset()
 
     def _update_mempool_metrics(self) -> None:
         """Update memory pool metrics for all cache engines."""
@@ -967,11 +656,14 @@ class GlobalCacheEngine:
             return
         for device_type, engine in self.cache_engines.items():
             if hasattr(engine, 'mempool'):
+                # `mempool` is engine-specific and not part of CacheEngineLike;
+                # getattr keeps it cast-free (and it is guarded by hasattr above).
+                mempool = getattr(engine, 'mempool')
                 device_label = DEVICE_TYPE[device_type].lower()
                 self._metrics_collector.update_mempool_stats(
                     device_label,
-                    engine.mempool.num_total_blocks,
-                    engine.mempool.num_free_blocks
+                    mempool.num_total_blocks,
+                    mempool.num_free_blocks
                 )
 
     def get(self,
@@ -1013,9 +705,9 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
 
-        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+        if not self.cache_config.enable_lake or temp_cache_strategy.ignore_lake:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
-            plan = self._get_impl_local(
+            plan = self._get_impl_without_lake(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1027,7 +719,7 @@ class GlobalCacheEngine:
             )
         else:
             #TODO pcfs will be supported later
-            plan = self._get_impl_global(
+            plan = self._get_impl_with_lake(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1046,12 +738,12 @@ class GlobalCacheEngine:
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
-            # Prefetch return_mask covers full-KV tokens only. SWA REMOTE2H ops
+            # Prefetch return_mask covers full-KV tokens only. SWA LAKE2H ops
             # (is_swa=True) live in a separate slot space and must not be summed
             # into prefetch_blocks, or the mask over-extends by SWA slot count.
             prefetch_blocks = 0
             for op in transfer_graph._op_map.values():
-                if op.transfer_type == TransferType.REMOTE2H and not op.is_swa:
+                if op.transfer_type == TransferType.LAKE2H and not op.is_swa:
                     prefetch_blocks += len(op.src_block_ids)
             if prefetch_blocks > 0:
                 return_mask[block_start_idx * self.tokens_per_block:
@@ -1136,45 +828,45 @@ class GlobalCacheEngine:
             cpu_swa_slot: int = -1,
             ssd_blocks: Optional[np.ndarray] = None,
             ssd_swa_slot: int = -1,
-            remote_blocks: Optional[np.ndarray] = None,
-            remote_swa_slot: int = -1) -> PutTransferPlan:
+            lake_blocks: Optional[np.ndarray] = None,
+            lake_swa_slot: int = -1) -> PutTransferPlan:
         flexkv_logger.warning(
             "[FlexKV-SWA] PUT request failed before radix insert; "
             f"request_id={request_id}, reason={reason}, "
             f"cpu_blocks={len(cpu_blocks)}, ssd_blocks={0 if ssd_blocks is None else len(ssd_blocks)}, "
-            f"remote_blocks={0 if remote_blocks is None else len(remote_blocks)}, "
+            f"lake_blocks={0 if lake_blocks is None else len(lake_blocks)}, "
             f"cpu_swa_slot={cpu_swa_slot}, ssd_swa_slot={ssd_swa_slot}, "
-            f"remote_swa_slot={remote_swa_slot}"
+            f"lake_swa_slot={lake_swa_slot}"
         )
         if cpu_swa_slot >= 0:
             self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
         if ssd_swa_slot >= 0:
             self.ssd_cache_engine._free_swa_slot(ssd_swa_slot)
-        if remote_swa_slot >= 0:
-            self.remote_cache_engine._free_swa_slot(remote_swa_slot)
+        if lake_swa_slot >= 0:
+            self.lake_cache_engine._free_swa_slot(lake_swa_slot)
         self.cpu_cache_engine.recycle(cpu_blocks)
         if ssd_blocks is not None:
             self.ssd_cache_engine.recycle(ssd_blocks)
-        if remote_blocks is not None:
-            self.remote_cache_engine.recycle(remote_blocks)
+        if lake_blocks is not None:
+            self.lake_cache_engine.recycle(lake_blocks)
         return self._empty_put_return(request_id)
 
-    def _get_impl_global(self,
-            request_id: int,
-            sequence_meta: SequenceMeta,
-            block_mask_start: int,
-            block_mask_end: int,
-            gpu_block_ids: np.ndarray,
-            temp_cache_strategy: CacheStrategy,
-            dp_client_id: int,
-            swa_aware: bool = False) \
-                 -> GetTransferPlan:
+    def _get_impl_with_lake(self,
+                            request_id: int,
+                            sequence_meta: SequenceMeta,
+                            block_mask_start: int,
+                            block_mask_end: int,
+                            gpu_block_ids: np.ndarray,
+                            temp_cache_strategy: CacheStrategy,
+                            dp_client_id: int,
+                            swa_aware: bool = False) \
+                                -> GetTransferPlan:
         """
         transfer pattern:
 
         GPU: (gpu cached) | fragment1 | fragment2      | fragment3      | (need compute)
                                ↑          ↑               ↑
-        CPU:     ...      | fragment1 | fragment2(new) | fragment3(new) ← (from REMOTE)
+        CPU:     ...      | fragment1 | fragment2(new) | fragment3(new) ← (from LAKE)
                                           ↑               ↓
         SSD:     ...      | fragment1 | fragment2      | fragment3(new)
 
@@ -1182,14 +874,11 @@ class GlobalCacheEngine:
         enable_gpu = not temp_cache_strategy.ignore_gpu
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd
-        enable_remote = self.cache_config.enable_remote and not temp_cache_strategy.ignore_remote
-        assert enable_cpu and enable_remote
+        enable_lake = self.cache_config.enable_lake and not temp_cache_strategy.ignore_lake
+        assert enable_cpu and enable_lake
         assert self.cpu_cache_engine is not None
-        assert self.remote_cache_engine is not None
-        if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
-        else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
+        assert self.lake_cache_engine is not None
+        cpu_matched_result, ssd_matched_result, lake_matched_result = self.match_with_lake(sequence_meta)
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
         if swa_aware:
@@ -1198,7 +887,7 @@ class GlobalCacheEngine:
                 block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result,
-                 DeviceType.REMOTE: remote_matched_result},
+                 DeviceType.LAKE: lake_matched_result},
                 sequence_meta=sequence_meta,
             )
             protected_cpu_node = (
@@ -1218,14 +907,14 @@ class GlobalCacheEngine:
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        remote_matched_blocks = remote_matched_result.physical_blocks[
-            :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = (self.cache_config.enable_kv_sharing and self.index_accel
+        lake_matched_blocks = lake_matched_result.physical_blocks[
+            :lake_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+        shared_pcfs_read = (self.cache_config.enable_kv_sharing
                             and not self.use_mooncake_store_backend)
-        remote_file_nodeids = None
+        lake_file_nodeids = None
         if shared_pcfs_read:
-            remote_file_nodeids = remote_matched_result.block_node_ids
-        fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
+            lake_file_nodeids = lake_matched_result.block_node_ids
+        fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(lake_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
             self._release_swa_read_reservation(swa_reservation)
@@ -1242,19 +931,19 @@ class GlobalCacheEngine:
         fragment1_num_blocks = len(cpu_matched_blocks)
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
-        fragment3_num_blocks = max(len(remote_matched_blocks) - fragment12_num_blocks, 0)
+        fragment3_num_blocks = max(len(lake_matched_blocks) - fragment12_num_blocks, 0)
         fragment23_num_blocks = fragment2_num_blocks + fragment3_num_blocks
 
         fragment123_gpu_blocks = gpu_block_ids[:fragment123_num_blocks]
         fragment123_cpu_blocks = cpu_matched_blocks
         fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
-        fragment3_remote_blocks = remote_matched_blocks[-fragment3_num_blocks:]
-        fragment3_remote_file_nodeids = None
+        fragment3_lake_blocks = lake_matched_blocks[-fragment3_num_blocks:]
+        fragment3_lake_file_nodeids = None
         if shared_pcfs_read:
-            fragment3_remote_file_nodeids = remote_file_nodeids[-fragment3_num_blocks:]
+            fragment3_lake_file_nodeids = lake_file_nodeids[-fragment3_num_blocks:]
         cpu_node_to_unlock = cpu_matched_result.last_ready_node
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
-        remote_node_to_unlock = remote_matched_result.last_ready_node
+        lake_node_to_unlock = lake_matched_result.last_ready_node
         cpu_blocks_to_free = np.array([], dtype=np.int64)
 
         if fragment23_num_blocks > 0:
@@ -1299,8 +988,8 @@ class GlobalCacheEngine:
             self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
             # SSD hit blocks (blocks loaded from SSD)
             self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
-            # Remote hit blocks (blocks loaded from remote)
-            self._metrics_collector.record_cache_hit("remote", fragment3_num_blocks)
+            # Lake hit blocks (blocks loaded from the lake tier)
+            self._metrics_collector.record_cache_hit("lake", fragment3_num_blocks)
             # Miss blocks (not in any cache)
             miss_blocks = total_query_blocks - fragment123_num_blocks
             if miss_blocks > 0:
@@ -1317,7 +1006,7 @@ class GlobalCacheEngine:
             )
             transfer_graph.add_transfer_op(op_disk2h)
 
-        op_remote2h = None
+        op_lake2h = None
         if fragment3_num_blocks > 0:
             mooncake_block_hashes = None
             if self.use_mooncake_store_backend:
@@ -1325,25 +1014,25 @@ class GlobalCacheEngine:
                     block_mask_start + fragment12_num_blocks:
                     block_mask_start + fragment12_num_blocks + fragment3_num_blocks
                 ]
-            op_remote2h = TransferOp(
+            op_lake2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.REMOTE2H,
-                src_block_ids = fragment3_remote_blocks,
+                transfer_type = TransferType.LAKE2H,
+                src_block_ids = fragment3_lake_blocks,
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
-                src_block_node_ids = fragment3_remote_file_nodeids,
+                src_block_node_ids = fragment3_lake_file_nodeids,
                 dp_client_id = dp_client_id,
                 mooncake_store_block_hashes = mooncake_block_hashes,
             )
-            transfer_graph.add_transfer_op(op_remote2h)
+            transfer_graph.add_transfer_op(op_lake2h)
 
         # prepare ssd blocks to transfer
-        write_ssd_blocks_from_remote = False
+        write_ssd_blocks_from_lake = False
         if (enable_ssd and
-            op_remote2h is not None and
+            op_lake2h is not None and
             ssd_matched_result.num_ready_matched_blocks >= block_mask_start and
             ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
             # only when the above all are satisfied, we load data back from cpu to ssd
-            write_ssd_blocks_from_remote = True
+            write_ssd_blocks_from_lake = True
             fragment3_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment3_num_blocks,
                 protected_node=ssd_matched_result.last_node,
@@ -1351,8 +1040,8 @@ class GlobalCacheEngine:
             )
             if len(fragment3_ssd_blocks) < fragment3_num_blocks:
                 self.ssd_cache_engine.recycle(fragment3_ssd_blocks)
-                write_ssd_blocks_from_remote = False
-            if write_ssd_blocks_from_remote:
+                write_ssd_blocks_from_lake = False
+            if write_ssd_blocks_from_lake:
                 op_h2disk = TransferOp(
                     graph_id = transfer_graph.graph_id,
                     transfer_type = TransferType.H2DISK,
@@ -1361,7 +1050,7 @@ class GlobalCacheEngine:
                     dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_h2disk)
-                transfer_graph.add_dependency(op_h2disk.op_id, op_remote2h.op_id)
+                transfer_graph.add_dependency(op_h2disk.op_id, op_lake2h.op_id)
 
                 ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
                                                                 fragment3_ssd_blocks,
@@ -1380,8 +1069,8 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
                 transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-            if op_remote2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_remote2h.op_id)
+            if op_lake2h is not None:
+                transfer_graph.add_dependency(op_h2d.op_id, op_lake2h.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
@@ -1389,8 +1078,8 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
-        if remote_node_to_unlock is not None:
-            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
+        if lake_node_to_unlock is not None:
+            node_to_unlock[DeviceType.LAKE] = (lake_node_to_unlock, lake_node_to_unlock.size())
 
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
@@ -1415,16 +1104,16 @@ class GlobalCacheEngine:
             swa_reservation=swa_reservation,
         )
 
-    def _get_impl_local(self,
-                        request_id: int,
-                        sequence_meta: SequenceMeta,
-                        block_mask_start: int,
-                        block_mask_end: int,
-                        gpu_block_ids: np.ndarray,
-                        temp_cache_strategy: CacheStrategy,
-                        dp_client_id: int,
-                        swa_aware: bool = False) \
-                            -> GetTransferPlan:
+    def _get_impl_without_lake(self,
+                               request_id: int,
+                               sequence_meta: SequenceMeta,
+                               block_mask_start: int,
+                               block_mask_end: int,
+                               gpu_block_ids: np.ndarray,
+                               temp_cache_strategy: CacheStrategy,
+                               dp_client_id: int,
+                               swa_aware: bool = False) \
+                                   -> GetTransferPlan:
         """
         transfer pattern:
 
@@ -1435,7 +1124,7 @@ class GlobalCacheEngine:
         SSD(+peerSSD):     ...      | fragment1 | fragment2      | (uncached)
 
         """
-        nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
+        nvtx_range = nvtx.start_range(message=f"CacheEngine._get_impl_without_lake[{request_id}]", color="cyan")
         enable_gpu = not temp_cache_strategy.ignore_gpu
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
@@ -1443,11 +1132,8 @@ class GlobalCacheEngine:
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
-        if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(
-                sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
-        else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
+        cpu_matched_result, ssd_matched_result = self.match_without_lake(
+            sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
 
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
@@ -1717,8 +1403,8 @@ class GlobalCacheEngine:
                                      namespace=namespace)
 
         assert not temp_cache_strategy.ignore_gpu
-        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            plan = self._put_impl_local(
+        if not self.cache_config.enable_lake or temp_cache_strategy.ignore_lake:
+            plan = self._put_impl_without_lake(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1728,7 +1414,7 @@ class GlobalCacheEngine:
                 dp_client_id,
             )
         else:
-            plan = self._put_impl_global(
+            plan = self._put_impl_with_lake(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1771,15 +1457,15 @@ class GlobalCacheEngine:
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
-    def _put_impl_global(self,
-            request_id: int,
-            sequence_meta: SequenceMeta,
-            block_mask_start: int,
-            block_mask_end: int,
-            gpu_block_ids: np.ndarray,
-            temp_cache_strategy: CacheStrategy,
-            dp_client_id: int) \
-                -> PutTransferPlan:
+    def _put_impl_with_lake(self,
+                            request_id: int,
+                            sequence_meta: SequenceMeta,
+                            block_mask_start: int,
+                            block_mask_end: int,
+                            gpu_block_ids: np.ndarray,
+                            temp_cache_strategy: CacheStrategy,
+                            dp_client_id: int) \
+                                -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -1791,32 +1477,27 @@ class GlobalCacheEngine:
 
         CPU:            ...           |     fragment3      |
                                                ↓ (from cpu)
-        REMOTE:     (remote cached)   |   fragment3(new)   |
+        LAKE:     (remote cached)   |   fragment3(new)   |
 
         """
         enable_gpu = not temp_cache_strategy.ignore_gpu
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
-        enable_remote = self.cache_config.enable_remote and not temp_cache_strategy.ignore_remote
+        enable_lake = self.cache_config.enable_lake and not temp_cache_strategy.ignore_lake
         assert enable_gpu
         assert enable_cpu
-        assert enable_remote
+        assert enable_lake
         assert self.cpu_cache_engine is not None
-        assert self.remote_cache_engine is not None
+        assert self.lake_cache_engine is not None
 
-        if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta,
-                                                                                               temp_cache_strategy=temp_cache_strategy,
-                                                                                               is_get=False)
-        else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
-                                                                                           temp_cache_strategy=temp_cache_strategy)
+        cpu_matched_result, ssd_matched_result, lake_matched_result = self.match_with_lake(
+            sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
-        remote_matched_blocks = remote_matched_result.physical_blocks[
-            :remote_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+        lake_matched_blocks = lake_matched_result.physical_blocks[
+            :lake_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1828,13 +1509,13 @@ class GlobalCacheEngine:
 
         # NOTE: to avoid full kv repeating write in mooncake store.
         if self.use_mooncake_store_backend:
-            kv_hit = int(getattr(remote_matched_result, "kv_matched_blocks", 0)
-                         or remote_matched_result.num_matched_blocks)
-            remote_put_hit_blocks = max(0, min(len(gpu_block_ids), kv_hit - block_mask_start))
-            fragment3_num_blocks = len(gpu_block_ids) - remote_put_hit_blocks
+            kv_hit = int(getattr(lake_matched_result, "kv_matched_blocks", 0)
+                         or lake_matched_result.num_matched_blocks)
+            lake_put_hit_blocks = max(0, min(len(gpu_block_ids), kv_hit - block_mask_start))
+            fragment3_num_blocks = len(gpu_block_ids) - lake_put_hit_blocks
         else:
-            remote_put_hit_blocks = len(remote_matched_blocks)
-            fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
+            lake_put_hit_blocks = len(lake_matched_blocks)
+            fragment3_num_blocks = len(gpu_block_ids) - len(lake_matched_blocks)
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
@@ -1859,23 +1540,23 @@ class GlobalCacheEngine:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
         else:
             fragment2_ssd_blocks = np.array([], dtype=np.int64)
-        put_to_remote = False
+        put_to_lake = False
         if fragment3_num_blocks > 0:
-            fragment3_remote_blocks = self.remote_cache_engine.take(
+            fragment3_lake_blocks = self.lake_cache_engine.take(
                 num_required_blocks=fragment3_num_blocks,
-                protected_node = remote_matched_result.last_node,
+                protected_node = lake_matched_result.last_node,
                 strict=False
             )
-            if len(fragment3_remote_blocks) == fragment3_num_blocks:
-                put_to_remote = True
+            if len(fragment3_lake_blocks) == fragment3_num_blocks:
+                put_to_lake = True
             else:
-                self.remote_cache_engine.recycle(fragment3_remote_blocks)
+                self.lake_cache_engine.recycle(fragment3_lake_blocks)
         else:
-            fragment3_remote_blocks = np.array([], dtype=np.int64)
+            fragment3_lake_blocks = np.array([], dtype=np.int64)
 
         cpu_swa_slot = -1
         ssd_swa_slot = -1
-        remote_swa_slot = -1
+        lake_swa_slot = -1
         mooncake_swa_tail_hash: Optional[str] = None
 
         if self.swa_op_constructor.enabled:
@@ -1886,19 +1567,19 @@ class GlobalCacheEngine:
                     ssd_matched_result.last_node)
             if (cpu_swa_slot >= 0 and
                     (not put_to_ssd or ssd_swa_slot >= 0) and
-                    put_to_remote):
+                    put_to_lake):
                 if self.use_mooncake_store_backend:
-                    # Key-addressed store: no remote slot to reserve / mount.
+                    # Key-addressed store: no lake slot to reserve / mount.
                     # SWA snapshot keyed by the tail hash of the written prefix.
                     tail_idx = block_mask_start + len(gpu_block_ids) - 1
                     mooncake_swa_tail_hash = str(
                         sequence_meta.block_hashes[tail_idx])
                 else:
-                    remote_swa_slot = self.remote_cache_engine._alloc_swa_slot(
-                        remote_matched_result.last_node)
+                    lake_swa_slot = self.lake_cache_engine._alloc_swa_slot(
+                        lake_matched_result.last_node)
             if (cpu_swa_slot < 0 or
                     (put_to_ssd and ssd_swa_slot < 0) or
-                    (put_to_remote and remote_swa_slot < 0
+                    (put_to_lake and lake_swa_slot < 0
                      and mooncake_swa_tail_hash is None)):
                 return self._fail_put_before_insert(
                     request_id=request_id,
@@ -1907,8 +1588,8 @@ class GlobalCacheEngine:
                     cpu_swa_slot=cpu_swa_slot,
                     ssd_blocks=fragment2_ssd_blocks if put_to_ssd else None,
                     ssd_swa_slot=ssd_swa_slot,
-                    remote_blocks=fragment3_remote_blocks if put_to_remote else None,
-                    remote_swa_slot=remote_swa_slot,
+                    lake_blocks=fragment3_lake_blocks if put_to_lake else None,
+                    lake_swa_slot=lake_swa_slot,
                 )
 
         transfer_graph = TransferOpGraph()
@@ -1953,7 +1634,7 @@ class GlobalCacheEngine:
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
-        if put_to_remote:
+        if put_to_lake:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
                 fragment3_cpu_blocks = np.concatenate([cpu_matched_blocks[-extra_num_cpu_blocks:],
@@ -1963,47 +1644,47 @@ class GlobalCacheEngine:
             mooncake_block_hashes = None
             if self.use_mooncake_store_backend:
                 mooncake_block_hashes = sequence_meta.block_hashes[
-                    block_mask_start + remote_put_hit_blocks:
-                    block_mask_start + remote_put_hit_blocks + fragment3_num_blocks
+                    block_mask_start + lake_put_hit_blocks:
+                    block_mask_start + lake_put_hit_blocks + fragment3_num_blocks
                 ]
-            op_h2remote = TransferOp(
+            op_h2lake = TransferOp(
                 graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2REMOTE,
+                transfer_type = TransferType.H2LAKE,
                 src_block_ids = fragment3_cpu_blocks,
-                dst_block_ids = fragment3_remote_blocks,
+                dst_block_ids = fragment3_lake_blocks,
                 dp_client_id = dp_client_id,
                 mooncake_store_block_hashes = mooncake_block_hashes,
             )
-            transfer_graph.add_transfer_op(op_h2remote)
-            transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
+            transfer_graph.add_transfer_op(op_h2lake)
+            transfer_graph.add_dependency(op_h2lake.op_id, op_d2h.op_id)
 
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
-            put_remote_via_mooncake = (
+            put_lake_via_mooncake = (
                 mooncake_swa_tail_hash is not None and cpu_swa_slot >= 0)
-            if remote_swa_slot >= 0:
-                remote_slot_ids = np.array([remote_swa_slot], dtype=np.int64)
-            elif put_remote_via_mooncake:
-                remote_slot_ids = np.array([0], dtype=np.int64) # slot 0 will not be used in mooncake store backend.
+            if lake_swa_slot >= 0:
+                lake_slot_ids = np.array([lake_swa_slot], dtype=np.int64)
+            elif put_lake_via_mooncake:
+                lake_slot_ids = np.array([0], dtype=np.int64) # slot 0 will not be used in mooncake store backend.
             else:
-                remote_slot_ids = empty
+                lake_slot_ids = empty
             swa_ops = self.swa_op_constructor.build_put_chain(
                 transfer_graph,
                 gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
                 cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
                 ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
                               if ssd_swa_slot >= 0 else empty),
-                remote_slot_ids=remote_slot_ids,
+                lake_slot_ids=lake_slot_ids,
                 dp_client_id=dp_client_id,
                 return_op_ids=True,
                 mooncake_tail_hashes=(
-                    [mooncake_swa_tail_hash] if put_remote_via_mooncake else None),
+                    [mooncake_swa_tail_hash] if put_lake_via_mooncake else None),
             )
             assert swa_ops.d2h_id is not None
             if put_to_ssd:
                 assert swa_ops.h2disk_id is not None
-            if put_to_remote and (remote_swa_slot >= 0 or put_remote_via_mooncake):
-                assert swa_ops.h2remote_id is not None
+            if put_to_lake and (lake_swa_slot >= 0 or put_lake_via_mooncake):
+                assert swa_ops.h2lake_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(
@@ -2024,26 +1705,26 @@ class GlobalCacheEngine:
             )
             op_node_to_ready[op_h2disk.op_id] = (
                 DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
-        remote_node_to_unlock = None
-        if put_to_remote:
-            remote_node_to_unlock = self.remote_cache_engine.insert(
+        lake_node_to_unlock = None
+        if put_to_lake:
+            lake_node_to_unlock = self.lake_cache_engine.insert(
                 sequence_meta,
-                fragment3_remote_blocks,
+                fragment3_lake_blocks,
                 is_ready=False,
-                match_result=remote_matched_result,
+                match_result=lake_matched_result,
             )
-            op_node_to_ready[op_h2remote.op_id] = (
-                DeviceType.REMOTE,
-                remote_node_to_unlock,
-                remote_node_to_unlock.size(),
+            op_node_to_ready[op_h2lake.op_id] = (
+                DeviceType.LAKE,
+                lake_node_to_unlock,
+                lake_node_to_unlock.size(),
             )
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
-        if remote_node_to_unlock is not None:
-            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
+        if lake_node_to_unlock is not None:
+            node_to_unlock[DeviceType.LAKE] = (lake_node_to_unlock, lake_node_to_unlock.size())
 
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
         if cpu_swa_slot >= 0:
@@ -2060,18 +1741,18 @@ class GlobalCacheEngine:
                 partial(self._publish_swa_put_slot,
                         DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
             )
-        if remote_swa_slot >= 0:
+        if lake_swa_slot >= 0:
             self._append_op_callback(
                 op_callback_dict,
-                swa_ops.h2remote_id,
+                swa_ops.h2lake_id,
                 partial(self._publish_swa_put_slot,
-                        DeviceType.REMOTE, remote_node_to_unlock, remote_swa_slot),
+                        DeviceType.LAKE, lake_node_to_unlock, lake_swa_slot),
             )
         skipped_gpu_blocks = len(cpu_matched_blocks)
         swa_slots_to_free = [(device_type, slot) for device_type, slot in
                              ((DeviceType.CPU, cpu_swa_slot),
                               (DeviceType.SSD, ssd_swa_slot),
-                              (DeviceType.REMOTE, remote_swa_slot)) if slot >= 0]
+                              (DeviceType.LAKE, lake_swa_slot)) if slot >= 0]
         return PutTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
@@ -2083,15 +1764,15 @@ class GlobalCacheEngine:
             swa_slots_to_free=swa_slots_to_free,
         )
 
-    def _put_impl_local(self,
-            request_id: int,
-            sequence_meta: SequenceMeta,
-            block_mask_start: int,
-            block_mask_end: int,
-            gpu_block_ids: np.ndarray,
-            temp_cache_strategy: CacheStrategy,
-            dp_client_id: int) \
-                -> PutTransferPlan:
+    def _put_impl_without_lake(self,
+                               request_id: int,
+                               sequence_meta: SequenceMeta,
+                               block_mask_start: int,
+                               block_mask_end: int,
+                               gpu_block_ids: np.ndarray,
+                               temp_cache_strategy: CacheStrategy,
+                               dp_client_id: int) \
+                                   -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -2110,14 +1791,8 @@ class GlobalCacheEngine:
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
-        if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,
-                                                                            temp_cache_strategy=temp_cache_strategy,
-                                                                            is_put=True)
-        else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
-                                                                      temp_cache_strategy=temp_cache_strategy,
-                                                                      is_put=True)
+        cpu_matched_result, ssd_matched_result = self.match_without_lake(
+            sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -2236,7 +1911,7 @@ class GlobalCacheEngine:
                 cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
                 ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
                               if ssd_swa_slot >= 0 else empty),
-                remote_slot_ids=empty,
+                lake_slot_ids=empty,
                 dp_client_id=dp_client_id,
                 return_op_ids=True,
             )
@@ -2299,7 +1974,7 @@ class GlobalCacheEngine:
         )
 
     def _transfer_callback(self,
-                           node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
+                           node_to_unlock: Dict[DeviceType, Tuple[RadixNodeLike, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                            is_put: bool = False) -> None:
         if DeviceType.CPU in node_to_unlock:
@@ -2316,14 +1991,14 @@ class GlobalCacheEngine:
             self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
             if is_put and self.cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
-        if DeviceType.REMOTE in node_to_unlock:
-            assert self.remote_cache_engine is not None
-            self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
-            self.remote_cache_engine.set_ready(
-                node_to_unlock[DeviceType.REMOTE][0], True, node_to_unlock[DeviceType.REMOTE][1]
+        if DeviceType.LAKE in node_to_unlock:
+            assert self.lake_cache_engine is not None
+            self.lake_cache_engine.unlock(node_to_unlock[DeviceType.LAKE][0])
+            self.lake_cache_engine.set_ready(
+                node_to_unlock[DeviceType.LAKE][0], True, node_to_unlock[DeviceType.LAKE][1]
             )
             if is_put and self.enable_kv_sharing:
-                self.remote_cache_engine.insert_and_publish(node_to_unlock[DeviceType.REMOTE][0])
+                self.lake_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.LAKE][0])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 assert self.cpu_cache_engine is not None
@@ -2331,12 +2006,12 @@ class GlobalCacheEngine:
             if DeviceType.SSD in buffer_to_free:
                 assert self.ssd_cache_engine is not None
                 self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
-            if DeviceType.REMOTE in buffer_to_free:
-                assert self.remote_cache_engine is not None
-                self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
+            if DeviceType.LAKE in buffer_to_free:
+                assert self.lake_cache_engine is not None
+                self.lake_cache_engine.recycle(buffer_to_free[DeviceType.LAKE])
 
     def _abort_transfer_plan(self,
-                             node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
+                             node_to_unlock: Dict[DeviceType, Tuple[RadixNodeLike, int]],
                              buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                              swa_reservation: Optional[SWAReadReservation] = None,
                              swa_slots_to_free: Optional[List[Tuple[DeviceType, int]]] = None) -> None:
@@ -2365,24 +2040,24 @@ class GlobalCacheEngine:
                 if slot >= 0:
                     self.cache_engines[device_type]._free_swa_slot(slot)
 
-    def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
+    def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNodeLike, ready_length: int) -> None:
         if device_type == DeviceType.CPU:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.set_ready(node_to_ready, True, ready_length)
         elif device_type == DeviceType.SSD:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.set_ready(node_to_ready, True, ready_length)
-        elif device_type == DeviceType.REMOTE:
-            assert self.remote_cache_engine is not None
-            self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
+        elif device_type == DeviceType.LAKE:
+            assert self.lake_cache_engine is not None
+            self.lake_cache_engine.set_ready(node_to_ready, True, ready_length)
 
-    @nvtx.annotate("Match Prefix Accel", color="yellow")
-    def match_local_accel(self,
-                        sequence_meta: SequenceMeta,
-                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-                        is_put: bool = False,
-                        gpu_matched_blocks: int = 0) \
-                            -> Tuple[MatchResultAccel, MatchResultAccel]:
+    @nvtx.annotate("Match Prefix Accel Without Lake", color="yellow")
+    def match_without_lake(self,
+                           sequence_meta: SequenceMeta,
+                           temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                           is_put: bool = False,
+                           gpu_matched_blocks: int = 0) \
+                               -> Tuple[MatchResultAccel, MatchResultAccel]:
         #from flexkv.common.debug import flexkv_logger, summarize_id_tensor
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -2411,10 +2086,10 @@ class GlobalCacheEngine:
         return cpu_matched_result, ssd_matched_result
 
     def _is_mooncake_swa_tier(self, device_type: DeviceType) -> bool:
-        """True for the key-addressed mooncake-store REMOTE tier: SWA hits are
+        """True for the key-addressed mooncake-store LAKE tier: SWA hits are
         keyed by the hit block's tail hash instead of a node-mounted slot."""
         return (self.use_mooncake_store_backend
-                and device_type == DeviceType.REMOTE)
+                and device_type == DeviceType.LAKE)
 
     def _select_swa_read_source(
         self,
@@ -2494,23 +2169,23 @@ class GlobalCacheEngine:
         this GET. Returning ``None`` means the caller must report no cache hit;
         Full-only restore is invalid for an SWA-aware GET.
 
-        Mooncake-store REMOTE sources are key-addressed: no pin / host slot;
-        a placeholder remote slot id and ``mooncake_tail_hashes`` key the
-        SWA ``REMOTE2H`` op.
+        Mooncake-store LAKE sources are key-addressed: no pin / host slot;
+        a placeholder lake slot id and ``mooncake_tail_hashes`` key the
+        SWA ``LAKE2H`` op.
         """
         assert self.cpu_cache_engine is not None
         if not source.found:
             return None
 
         is_mooncake_source = source.is_mooncake
-        # Mooncake-store will skip pin_swa_node for remote source.
+        # Mooncake-store will skip pin_swa_node for lake source.
         if not is_mooncake_source:
             source.engine._pin_swa_node(source.node)
 
         staging_slot = -1
         cpu_swa_slots = np.array([source.host_slot], dtype=np.int64)
         ssd_swa_slots = np.array([], dtype=np.int64)
-        remote_swa_slots = np.array([], dtype=np.int64)
+        lake_swa_slots = np.array([], dtype=np.int64)
 
         if source.device_type != DeviceType.CPU:
             staging_slot = self.cpu_cache_engine._alloc_swa_slot(
@@ -2526,20 +2201,20 @@ class GlobalCacheEngine:
                 return None
             cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
             if is_mooncake_source:
-                remote_swa_slots = np.array([0], dtype=np.int64)
+                lake_swa_slots = np.array([0], dtype=np.int64)
             else:
                 source_slots = np.array([source.host_slot], dtype=np.int64)
                 if source.device_type == DeviceType.SSD:
                     ssd_swa_slots = source_slots
                 else:
-                    remote_swa_slots = source_slots
+                    lake_swa_slots = source_slots
 
         h2d_id = self.swa_op_constructor.build_get_chain(
             graph,
             gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
             cpu_slot_ids=cpu_swa_slots,
             ssd_slot_ids=ssd_swa_slots,
-            remote_slot_ids=remote_swa_slots,
+            lake_slot_ids=lake_swa_slots,
             dp_client_id=dp_client_id,
             mooncake_tail_hashes=(
                 [source.mooncake_tail_hash] if is_mooncake_source else None),
@@ -2585,9 +2260,9 @@ class GlobalCacheEngine:
         For a CPU-sourced load, ``node`` is the matched CPU SWA node and its pin
         is dropped with the plain dec (dec_swa_lock_ref, NOT dec_swa_lock_only):
         the loaded window stays cached for future reuse. For a staged
-        (SSD/REMOTE) source, ``node`` is the source-tier node (same pin release)
+        (SSD/LAKE) source, ``node`` is the source-tier node (same pin release)
         and ``staging_slot`` is the transient CPU SWA slot used as the DISK2H/
-        REMOTE2H destination — it is unmounted (not a cached entry), so free it
+        LAKE2H destination — it is unmounted (not a cached entry), so free it
         back to the CPU SWA pool. No-op on parts that are absent."""
         try:
             if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
@@ -2608,61 +2283,26 @@ class GlobalCacheEngine:
         except Exception:  # noqa: BLE001
             pass
 
-    @nvtx.annotate("Match Prefix", color="yellow")
-    def match_local(self,
-                    sequence_meta: SequenceMeta,
-                    temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-                    is_put: bool = False) \
-                        -> Tuple[MatchResult, MatchResult]:
-        cpu_matched_result = MatchResult()
-        ssd_matched_result = MatchResult()
-        if self.cpu_cache_engine:
-            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
-            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-
-        return cpu_matched_result, ssd_matched_result
-
-    @nvtx.annotate("Match All Prefix accel", color="yellow")
-    def match_all_accel(self,
+    @nvtx.annotate("Match Prefix Accel With Lake", color="yellow")
+    def match_with_lake(self,
                         sequence_meta: SequenceMeta,
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-                        is_get: bool = True) \
+                        is_put: bool = False) \
                             -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
-        remote_matched_result = MatchResultAccel()
+        lake_matched_result = MatchResultAccel()
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
-            if self.enable_kv_sharing:
-                if is_get:
-                    remote_matched_result = self.remote_cache_engine.match_all(sequence_meta)
-                else:
-                    remote_matched_result = self.remote_cache_engine.match_local(sequence_meta)
+        if self.lake_cache_engine and not temp_cache_strategy.ignore_lake:
+            if self.enable_kv_sharing and is_put:
+                lake_matched_result = self.lake_cache_engine.match_local(sequence_meta)
             else:
-                remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+                lake_matched_result = self.lake_cache_engine.match(sequence_meta)
 
-        return cpu_matched_result, ssd_matched_result, remote_matched_result
-
-    @nvtx.annotate("Match All Prefix", color="yellow")
-    def match_all(self,
-                  sequence_meta: SequenceMeta,
-                  temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
-                      -> Tuple[MatchResult, MatchResult, MatchResult]:
-        cpu_matched_result = MatchResult()
-        ssd_matched_result = MatchResult()
-        remote_matched_result = MatchResult()
-        if self.cpu_cache_engine:
-            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
-            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
-            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
-
-        return cpu_matched_result, ssd_matched_result, remote_matched_result
+        return cpu_matched_result, ssd_matched_result, lake_matched_result
 
     def _check_input(self,
                       token_ids: np.ndarray,

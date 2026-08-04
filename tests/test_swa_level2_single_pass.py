@@ -44,7 +44,7 @@ def _model_config():
 def _cache_config():
     cc = CacheConfig(
         tokens_per_block=TPB,
-        enable_cpu=True, enable_ssd=False, enable_remote=False,
+        enable_cpu=True, enable_ssd=False, enable_lake=False,
         # These tests store at most four blocks.  Keeping the pools small avoids
         # retaining hundreds of megabytes across the parametrized smoke suite.
         num_cpu_blocks=32,
@@ -80,33 +80,33 @@ def _put(eng, tok, req=1):
 class _MatchCounter:
     """Wrap the engine's per-tier match entry points and count invocations.
 
-    CPU-only config routes through ``match_local_accel``; we also wrap
-    ``match_all_accel`` so the same counter works if a tier config changes.
+    CPU-only config routes through ``match_without_lake``; we also wrap
+    ``match_with_lake`` so the same counter works if a tier config changes.
     Each call = one round of per-tier radix matching.
     """
 
     def __init__(self, eng):
         self.eng = eng
         self.n = 0
-        self._orig_local = eng.match_local_accel
-        self._orig_all = eng.match_all_accel
+        self._orig_without_lake = eng.match_without_lake
+        self._orig_with_lake = eng.match_with_lake
 
     def __enter__(self):
-        def local(*a, **k):
+        def without_lake(*a, **k):
             self.n += 1
-            return self._orig_local(*a, **k)
+            return self._orig_without_lake(*a, **k)
 
-        def allm(*a, **k):
+        def with_lake(*a, **k):
             self.n += 1
-            return self._orig_all(*a, **k)
+            return self._orig_with_lake(*a, **k)
 
-        self.eng.match_local_accel = local
-        self.eng.match_all_accel = allm
+        self.eng.match_without_lake = without_lake
+        self.eng.match_with_lake = with_lake
         return self
 
     def __exit__(self, *exc):
-        self.eng.match_local_accel = self._orig_local
-        self.eng.match_all_accel = self._orig_all
+        self.eng.match_without_lake = self._orig_without_lake
+        self.eng.match_with_lake = self._orig_with_lake
         return False
 
 
