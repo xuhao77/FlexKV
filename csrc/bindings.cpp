@@ -679,7 +679,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("mla_d2h_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false)
+           py::arg("enable_trace") = false,
+           py::arg("packed_kv") = false)
       .def("layerwise_transfer_multi_group",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -704,7 +705,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("mla_d2h_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false);
+           py::arg("enable_trace") = false,
+           py::arg("packed_kv") = false);
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
@@ -811,7 +813,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"), py::arg("mla_d2h_mode") = "sharded",
-           py::arg("designated_rank") = 0);
+           py::arg("designated_rank") = 0, py::arg("packed_kv") = false);
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.
@@ -855,7 +857,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_block_stride_in_bytes"),
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
-           py::arg("layer_granularity"), py::arg("is_mla"));
+           py::arg("layer_granularity"), py::arg("is_mla"),
+           py::arg("packed_kv") = false);
 #endif
 
   // Add Hasher class binding

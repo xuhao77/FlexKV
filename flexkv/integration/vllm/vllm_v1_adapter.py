@@ -75,6 +75,39 @@ if TYPE_CHECKING:
 logger = flexkv_logger
 
 
+def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
+                        head_dim: int) -> None:
+    """Reject a KV cache whose heads outrank its tokens in memory.
+
+    A cache has the same logical shape under both of vLLM's cache layouts;
+    only the strides differ.  NHD stores it token-major, which is the order
+    FlexKV's workers assume, while HND stores it head-major.  Since the
+    workers derive addresses from KVCacheLayout's shape-implied strides and
+    never read ``tensor.stride()``, an HND cache would be read at the wrong
+    offsets and silently corrupt KV, so refuse it here.
+
+    Either extent being 1 makes the two layouts byte-identical, so those are
+    accepted -- a rank of a GQA model with one KV head is the common case.
+
+    Args:
+        kv_cache (torch.Tensor): one layer's KV cache.
+        token_dim (int): index of the tokens-per-block dimension.
+        head_dim (int): index of the KV-heads dimension.
+
+    Raises:
+        ValueError: if the cache is head-major (HND) rather than token-major.
+    """
+    if kv_cache.shape[head_dim] == 1 or kv_cache.shape[token_dim] == 1:
+        return
+    strides = kv_cache.stride()
+    if strides[head_dim] > strides[token_dim]:
+        raise ValueError(
+            "KV cache is head-major (HND); FlexKV addresses KV token-major. "
+            "Leave VLLM_KV_CACHE_LAYOUT unset to get the NHD default. "
+            f"shape={tuple(kv_cache.shape)} stride={strides}"
+        )
+
+
 @dataclass
 class FlexKVResponse:
     task_id: int
@@ -739,9 +772,29 @@ class FlexKVWorkerConnector:
             block_size = gpu_blocks[0].shape[1]
             num_kv_heads = 1
             head_size = gpu_blocks[0].shape[2]
+        elif gpu_blocks[0].ndim == 4:
+            # vLLM >= PR #44455: (num_blocks, num_kv_heads, block_size,
+            # 2 * head_size), with K and V interleaved in the last dim.  No
+            # stride can express that interleaving, so the packed pair is
+            # carried as one content dim instead (see KVCacheLayout.packed_kv).
+            if not self.flexkv_config.model_config.packed_kv:
+                raise ValueError(
+                    "received a packed 4D vLLM KV cache but packed_kv is not "
+                    f"set: shape={tuple(gpu_blocks[0].shape)}")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=1)
+            # packed_kv makes kv_dim 1, so LAYERFIRST's kv dim degenerates to
+            # extent 1 and its shape-implied strides reduce to the tensor's
+            # own block/token/head/content order, exactly as they do for MLA.
+            gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+            num_blocks = gpu_blocks[0].shape[0]
+            num_kv_heads = gpu_blocks[0].shape[1]
+            block_size = gpu_blocks[0].shape[2]
+            head_size = gpu_blocks[0].shape[3]
         else:
             assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
+                f"expect kv cached tensor has 4 or 5 dim "
+                f"but get shape={gpu_blocks[0].shape}.")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=3)
             # Detect GPU layout from the kv dim position (which holds size 2):
             #   vLLM <= 0.21: (kv=2, num_blocks, ...)  -> LAYERFIRST
             #   vLLM >= 0.23: (num_blocks, kv=2, ...)  -> LAYERBLOCK
@@ -765,6 +818,7 @@ class FlexKVWorkerConnector:
             num_head=num_kv_heads,
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
+            packed_kv=self.flexkv_config.model_config.packed_kv,
         )
 
         if not indexer_kv_caches:
